@@ -58,10 +58,31 @@ The default mode is local-first. Email text, summaries, extracted fields, workfl
 
 Cloud mode can be added later by swapping adapters, not by rewriting the workflow engine.
 
+## Outlook Connector
+
+The Outlook connector uses Microsoft Graph device-code sign-in. The local app stores OAuth tokens in the local SQLite database.
+
+Create a Microsoft Entra app registration, enable public-client/native authentication, and set these environment values:
+
+```powershell
+$env:OUTLOOK_CLIENT_ID="your-client-id"
+$env:OUTLOOK_TENANT_ID="common"
+$env:OUTLOOK_SCOPES="offline_access User.Read Mail.Read"
+```
+
+Then run:
+
+```powershell
+cd accountant_supporter\backend
+python -m app.main
+```
+
+Open `http://localhost:8080`, use the Outlook panel to start sign-in, enter the device code in Microsoft, check sign-in, then fetch recent inbox messages.
+
 ## Next Milestones
 
-1. Add OAuth connectors for Microsoft Graph and Gmail.
-2. Add Zoho Books OAuth and create draft bills/invoices.
-3. Add OpenAI structured extraction behind the `AIProcessor` adapter.
+1. Add Zoho Books OAuth and create draft bills/invoices.
+2. Add OpenAI structured extraction behind the `AIProcessor` adapter.
+3. Add Gmail as a second mail connector.
 4. Add signed workflow package updates.
 5. Add review/approval states before Zoho writes.

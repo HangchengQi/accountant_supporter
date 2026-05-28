@@ -3,12 +3,14 @@ from __future__ import annotations
 import html
 import json
 import os
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
 from .ai import LocalHeuristicProcessor
+from .outlook import DeviceCodeSession, OutlookGraphClient
 from .schemas import EmailSampleIn, ProcessedEmail
 from .storage import SQLiteStorage
 from .workflow import Workflow, load_workflow
@@ -26,6 +28,8 @@ def get_workflow_path() -> str:
 storage = SQLiteStorage(get_database_path())
 ai_processor = LocalHeuristicProcessor()
 zoho_client = DryRunZohoBooksClient()
+outlook_client = OutlookGraphClient()
+pending_outlook_auth: DeviceCodeSession | None = None
 
 
 def health() -> dict[str, str]:
@@ -56,6 +60,45 @@ def process_email_sample(email: EmailSampleIn) -> ProcessedEmail:
 
 def list_processed_emails() -> list[ProcessedEmail]:
     return storage.list_processed_emails()
+
+
+def outlook_status() -> dict[str, Any]:
+    return outlook_client.configured_status(has_token=storage.get_oauth_token("outlook") is not None)
+
+
+def start_outlook_auth() -> dict[str, Any]:
+    global pending_outlook_auth
+    pending_outlook_auth = outlook_client.start_device_code()
+    return pending_outlook_auth.to_dict()
+
+
+def poll_outlook_auth() -> dict[str, Any]:
+    global pending_outlook_auth
+    if pending_outlook_auth is None:
+        return {"status": "not_started"}
+    result = outlook_client.poll_device_code(pending_outlook_auth)
+    if result.get("status") == "connected":
+        storage.save_oauth_token("outlook", result["token"])
+        pending_outlook_auth = None
+    return {key: value for key, value in result.items() if key != "token"}
+
+
+def get_outlook_token() -> dict[str, Any]:
+    token = storage.get_oauth_token("outlook")
+    if not token:
+        raise ValueError("Outlook is not connected")
+    if float(token.get("expires_at", 0)) <= time.time() + 60:
+        token = outlook_client.refresh_token(token)
+        storage.save_oauth_token("outlook", token)
+    return token
+
+
+def list_outlook_messages(top: int = 10) -> list[dict[str, Any]]:
+    token = get_outlook_token()
+    return [
+        message.to_dict()
+        for message in outlook_client.list_inbox_messages(token=token, top=top)
+    ]
 
 
 def index() -> str:
@@ -105,6 +148,13 @@ def index() -> str:
             background: var(--panel);
             padding: 18px;
           }}
+          .connector {{
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: #ffffff;
+            margin-top: 18px;
+            padding: 18px;
+          }}
           label {{
             display: block;
             margin: 14px 0 6px;
@@ -135,6 +185,23 @@ def index() -> str:
             cursor: pointer;
           }}
           button:hover {{ background: var(--accent-dark); }}
+          button.secondary {{
+            background: #eef3f5;
+            color: var(--ink);
+            border: 1px solid #c9d4db;
+          }}
+          button.secondary:hover {{ background: #e0e9ed; }}
+          .toolbar {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 10px 0;
+          }}
+          .status {{
+            color: var(--muted);
+            font-size: 13px;
+            min-height: 20px;
+          }}
           article {{
             border-top: 1px solid var(--line);
             padding: 14px 0;
@@ -192,6 +259,17 @@ Amount due: $842.15
 Thank you.</textarea>
               <button type="submit">Process Email</button>
             </form>
+            <div class="connector">
+              <h2>Outlook</h2>
+              <div class="status" id="outlook-status">Checking status...</div>
+              <div class="toolbar">
+                <button class="secondary" type="button" id="outlook-start">Start sign-in</button>
+                <button class="secondary" type="button" id="outlook-poll">Check sign-in</button>
+                <button class="secondary" type="button" id="outlook-fetch">Fetch inbox</button>
+              </div>
+              <div id="outlook-auth"></div>
+              <div id="outlook-messages"></div>
+            </div>
           </section>
           <section class="records">
             <h2>Recent Results</h2>
@@ -199,6 +277,11 @@ Thank you.</textarea>
           </section>
         </main>
         <script>
+          let outlookMessages = [];
+          const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+          }}[char]));
+
           const form = document.getElementById('email-form');
           form.addEventListener('submit', async (event) => {{
             event.preventDefault();
@@ -214,6 +297,78 @@ Thank you.</textarea>
             }}
             window.location.reload();
           }});
+
+          async function outlookStatus() {{
+            const response = await fetch('/api/outlook/status');
+            const status = await response.json();
+            const target = document.getElementById('outlook-status');
+            if (!status.configured) {{
+              target.textContent = 'Set OUTLOOK_CLIENT_ID before signing in.';
+              return;
+            }}
+            target.textContent = status.connected ? 'Connected' : 'Ready to sign in';
+          }}
+
+          document.getElementById('outlook-start').addEventListener('click', async () => {{
+            const response = await fetch('/api/outlook/auth/start', {{ method: 'POST' }});
+            const result = await response.json();
+            if (!response.ok) {{
+              document.getElementById('outlook-auth').textContent = result.error || 'Unable to start sign-in';
+              return;
+            }}
+            document.getElementById('outlook-auth').innerHTML = `
+              <p>${{escapeHtml(result.message || 'Open Microsoft sign-in and enter the code.')}}</p>
+              <dl>
+                <dt>Code</dt><dd>${{escapeHtml(result.user_code)}}</dd>
+                <dt>URL</dt><dd><a href="${{escapeHtml(result.verification_uri)}}" target="_blank">${{escapeHtml(result.verification_uri)}}</a></dd>
+              </dl>
+            `;
+          }});
+
+          document.getElementById('outlook-poll').addEventListener('click', async () => {{
+            const response = await fetch('/api/outlook/auth/poll', {{ method: 'POST' }});
+            const result = await response.json();
+            document.getElementById('outlook-auth').textContent = result.status || result.error || 'No status';
+            await outlookStatus();
+          }});
+
+          document.getElementById('outlook-fetch').addEventListener('click', async () => {{
+            const response = await fetch('/api/outlook/messages?top=5');
+            const result = await response.json();
+            if (!response.ok) {{
+              document.getElementById('outlook-messages').textContent = result.error || 'Unable to fetch messages';
+              return;
+            }}
+            outlookMessages = result.messages || [];
+            document.getElementById('outlook-messages').innerHTML = outlookMessages.map((message, index) => `
+              <article>
+                <strong>${{escapeHtml(message.subject)}}</strong>
+                <div class="meta">${{escapeHtml(message.sender)}} | ${{escapeHtml(message.received_at || '')}}</div>
+                <p>${{escapeHtml(message.body_preview)}}</p>
+                <button class="secondary" type="button" onclick="processOutlookMessage(${{index}})">Process</button>
+              </article>
+            `).join('') || '<p>No messages found.</p>';
+          }});
+
+          async function processOutlookMessage(index) {{
+            const message = outlookMessages[index];
+            const response = await fetch('/api/email-samples/process', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{
+                subject: message.subject,
+                sender: message.sender,
+                body: message.body || message.body_preview
+              }})
+            }});
+            if (!response.ok) {{
+              alert('Processing failed');
+              return;
+            }}
+            window.location.reload();
+          }}
+
+          outlookStatus();
         </script>
       </body>
     </html>
@@ -247,10 +402,38 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/processed-emails":
             self._send_json([record.to_dict() for record in list_processed_emails()])
             return
+        if path == "/api/outlook/status":
+            self._send_json(outlook_status())
+            return
+        if path == "/api/outlook/messages":
+            query = urlparse(self.path).query
+            top = 10
+            if query.startswith("top="):
+                try:
+                    top = int(query.split("=", 1)[1])
+                except ValueError:
+                    top = 10
+            try:
+                self._send_json({"messages": list_outlook_messages(top=top)})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/outlook/auth/start":
+            try:
+                self._send_json(start_outlook_auth())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/outlook/auth/poll":
+            try:
+                self._send_json(poll_outlook_auth())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         if path != "/api/email-samples/process":
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return

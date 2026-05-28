@@ -40,6 +40,15 @@ class SQLiteStorage:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    provider TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    token_json TEXT NOT NULL
+                )
+                """
+            )
 
     def save_processed_email(
         self,
@@ -99,6 +108,34 @@ class SQLiteStorage:
                 """
             ).fetchall()
         return [self._row_to_processed_email(row) for row in rows]
+
+    def save_oauth_token(self, provider: str, token: dict[str, Any]) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO oauth_tokens (provider, updated_at, token_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(provider)
+                DO UPDATE SET updated_at = excluded.updated_at,
+                              token_json = excluded.token_json
+                """,
+                (provider, now, json.dumps(token)),
+            )
+
+    def get_oauth_token(self, provider: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT token_json
+                FROM oauth_tokens
+                WHERE provider = ?
+                """,
+                (provider,),
+            ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["token_json"])
 
     def _row_to_processed_email(self, row: sqlite3.Row) -> ProcessedEmail:
         return ProcessedEmail(
