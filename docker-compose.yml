@@ -1,0 +1,14 @@
+services:
+  app:
+    build:
+      context: ./backend
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env.example
+    environment:
+      DATABASE_PATH: /data/accountant_support.db
+      WORKFLOW_PATH: /app/workflows/vendor_invoice.v1.json
+    volumes:
+      - ./data:/data
+      - ./workflows:/app/workflows:ro

@@ -1,0 +1,18 @@
+{
+  "workflow": "vendor_invoice_email",
+  "version": 1,
+  "status": "active",
+  "trigger": {
+    "source": "manual_email_sample",
+    "accepted_categories": ["invoice", "receipt", "statement", "bookkeeping_question"]
+  },
+  "processing": {
+    "summary_sentences": 3,
+    "minimum_confidence_for_auto_upload": 0.9,
+    "require_human_review": true
+  },
+  "zoho": {
+    "mode": "dry_run",
+    "target_object": "bill_draft"
+  }
+}
