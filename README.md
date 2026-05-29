@@ -85,7 +85,27 @@ cd accountant_supporter\backend
 python -m app.main
 ```
 
-Open `http://localhost:8080`, use the Email Summary panel to connect Outlook, then fetch recent inbox messages.
+Open `http://localhost:8080`, use the Mail Authentication panel to connect Outlook, then use the Processing page to fetch recent inbox messages.
+
+## Zoho Books Connector
+
+The Zoho Books connector uses Zoho OAuth redirect sign-in. Add this redirect URI in the Zoho API Console:
+
+```text
+http://127.0.0.1:8080/auth/zoho/callback
+```
+
+Set these environment values before starting the local server:
+
+```powershell
+$env:ZOHO_CLIENT_ID="your-client-id"
+$env:ZOHO_CLIENT_SECRET="your-client-secret"
+$env:ZOHO_SCOPES="ZohoBooks.fullaccess.all"
+$env:ZOHO_REDIRECT_URI="http://127.0.0.1:8080/auth/zoho/callback"
+$env:ZOHO_ACCOUNTS_ROOT="https://accounts.zoho.com"
+```
+
+Use a regional `ZOHO_ACCOUNTS_ROOT` such as `https://accounts.zoho.eu` if your Zoho account is hosted outside the US data center.
 
 ## Next Milestones
 

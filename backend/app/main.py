@@ -15,7 +15,7 @@ from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
 from .schemas import EmailSampleIn, ProcessedEmail
 from .storage import SQLiteStorage
 from .workflow import Workflow, load_workflow
-from .zoho import DryRunZohoBooksClient
+from .zoho import DryRunZohoBooksClient, ZohoConfig, ZohoOAuthClient
 
 
 def get_database_path() -> str:
@@ -31,6 +31,7 @@ ai_processor = LocalHeuristicProcessor()
 zoho_client = DryRunZohoBooksClient()
 pending_outlook_auth: DeviceCodeSession | None = None
 pending_outlook_state: str | None = None
+pending_zoho_state: str | None = None
 
 
 def health() -> dict[str, str]:
@@ -69,10 +70,16 @@ def get_outlook_client() -> OutlookGraphClient:
     )
 
 
+def get_zoho_oauth_client() -> ZohoOAuthClient:
+    return ZohoOAuthClient(ZohoConfig.from_env())
+
+
 def outlook_status() -> dict[str, Any]:
     settings = storage.get_connector_settings("outlook") or {}
     client = get_outlook_client()
-    status = client.configured_status(has_token=storage.get_oauth_token("outlook") is not None)
+    status = client.configured_status(
+        has_token=storage.get_oauth_token("outlook") is not None
+    )
     status["settings"] = {
         "tenant_id": client.config.tenant_id,
         "scopes": client.config.scopes,
@@ -82,23 +89,9 @@ def outlook_status() -> dict[str, Any]:
     return status
 
 
-def save_outlook_settings(data: dict[str, Any]) -> dict[str, Any]:
-    client_id = str(data.get("client_id", "")).strip()
-    tenant_id = str(data.get("tenant_id", "common")).strip() or "common"
-    scopes = str(data.get("scopes", "offline_access User.Read Mail.Read")).strip()
-    if not client_id:
-        raise ValueError("client_id is required")
-    if not scopes:
-        raise ValueError("scopes are required")
-    storage.save_connector_settings(
-        "outlook",
-        {
-            "client_id": client_id,
-            "tenant_id": tenant_id,
-            "scopes": scopes,
-        },
-    )
-    return outlook_status()
+def zoho_status() -> dict[str, Any]:
+    client = get_zoho_oauth_client()
+    return client.configured_status(has_token=storage.get_oauth_token("zoho") is not None)
 
 
 def start_outlook_redirect_auth() -> str:
@@ -113,21 +106,49 @@ def complete_outlook_redirect_auth(query: str) -> str:
     params = parse_qs(query)
     if "error" in params:
         description = params.get("error_description", params["error"])[0]
-        return _auth_result_page("Outlook connection failed", description, False)
+        return auth_result_page("Mail connection failed", description, False)
     code = params.get("code", [""])[0]
     state = params.get("state", [""])[0]
     if not code:
-        return _auth_result_page("Outlook connection failed", "Missing authorization code.", False)
+        return auth_result_page("Mail connection failed", "Missing authorization code.", False)
     if not pending_outlook_state or state != pending_outlook_state:
-        return _auth_result_page("Outlook connection failed", "Invalid authorization state.", False)
+        return auth_result_page("Mail connection failed", "Invalid authorization state.", False)
 
-    outlook_client = get_outlook_client()
-    token = outlook_client.exchange_authorization_code(code)
+    token = get_outlook_client().exchange_authorization_code(code)
     storage.save_oauth_token("outlook", token)
     pending_outlook_state = None
-    return _auth_result_page(
-        "Outlook connected",
-        "You can close this tab and return to Accountant Supporter.",
+    return auth_result_page(
+        "Mail connected",
+        "Outlook is connected. Return to Accountant Supporter to fetch messages.",
+        True,
+    )
+
+
+def start_zoho_redirect_auth() -> str:
+    global pending_zoho_state
+    zoho_oauth = get_zoho_oauth_client()
+    pending_zoho_state = secrets.token_urlsafe(24)
+    return zoho_oauth.authorization_url(pending_zoho_state)
+
+
+def complete_zoho_redirect_auth(query: str) -> str:
+    global pending_zoho_state
+    params = parse_qs(query)
+    if "error" in params:
+        return auth_result_page("Zoho Books connection failed", params["error"][0], False)
+    code = params.get("code", [""])[0]
+    state = params.get("state", [""])[0]
+    if not code:
+        return auth_result_page("Zoho Books connection failed", "Missing authorization code.", False)
+    if not pending_zoho_state or state != pending_zoho_state:
+        return auth_result_page("Zoho Books connection failed", "Invalid authorization state.", False)
+
+    token = get_zoho_oauth_client().exchange_authorization_code(code)
+    storage.save_oauth_token("zoho", token)
+    pending_zoho_state = None
+    return auth_result_page(
+        "Zoho Books connected",
+        "Zoho Books is connected. Return to Accountant Supporter to continue.",
         True,
     )
 
@@ -156,225 +177,145 @@ def get_outlook_token() -> dict[str, Any]:
     if not token:
         raise ValueError("Outlook is not connected")
     if float(token.get("expires_at", 0)) <= time.time() + 60:
-        outlook_client = get_outlook_client()
-        token = outlook_client.refresh_token(token)
+        token = get_outlook_client().refresh_token(token)
         storage.save_oauth_token("outlook", token)
     return token
 
 
 def list_outlook_messages(top: int = 10) -> list[dict[str, Any]]:
     token = get_outlook_token()
-    outlook_client = get_outlook_client()
     return [
         message.to_dict()
-        for message in outlook_client.list_inbox_messages(token=token, top=top)
+        for message in get_outlook_client().list_inbox_messages(token=token, top=top)
     ]
 
 
-def index() -> str:
-    records = storage.list_processed_emails()
-    record_items = "\n".join(_render_record(record) for record in records)
+def page_shell(title: str, body: str, active: str = "") -> str:
+    nav = f"""
+      <nav>
+        <a class="{_active(active, 'home')}" href="/">Connections</a>
+        <a class="{_active(active, 'processing')}" href="/processing">Processing</a>
+      </nav>
+    """
     return f"""
     <!doctype html>
     <html lang="en">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Accountant Support</title>
-        <style>
-          :root {{
-            color-scheme: light;
-            --ink: #172026;
-            --muted: #61717d;
-            --line: #d8e0e6;
-            --panel: #f7f9fb;
-            --soft: #eef4f2;
-            --accent: #176b5d;
-            --accent-dark: #0f4d43;
-            --warn: #8a5a00;
-            --ok: #176b3e;
-          }}
-          * {{ box-sizing: border-box; }}
-          body {{
-            margin: 0;
-            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            color: var(--ink);
-            background: #ffffff;
-          }}
-          header {{
-            border-bottom: 1px solid var(--line);
-            padding: 22px clamp(18px, 4vw, 52px);
-            background: #fbfcfd;
-          }}
-          main {{
-            display: grid;
-            grid-template-columns: minmax(360px, 0.92fr) minmax(420px, 1.08fr);
-            gap: 28px;
-            padding: 28px clamp(18px, 4vw, 52px);
-          }}
-          h1 {{ margin: 0; font-size: 24px; }}
-          h2 {{ margin: 0 0 14px; font-size: 18px; }}
-          h3 {{ margin: 18px 0 10px; font-size: 14px; color: #31404a; }}
-          p {{ color: var(--muted); line-height: 1.5; }}
-          form, .records {{
-            border: 1px solid var(--line);
-            border-radius: 8px;
-            background: var(--panel);
-            padding: 18px;
-          }}
-          .connector {{
-            border: 1px solid var(--line);
-            border-radius: 8px;
-            background: #ffffff;
-            margin-top: 18px;
-            padding: 18px;
-          }}
-          .connector-head {{
-            display: flex;
-            align-items: start;
-            justify-content: space-between;
-            gap: 14px;
-          }}
-          .connector-head p {{ margin: 2px 0 0; font-size: 13px; }}
-          label {{
-            display: block;
-            margin: 14px 0 6px;
-            color: #31404a;
-            font-weight: 650;
-            font-size: 14px;
-          }}
-          input, textarea {{
-            width: 100%;
-            border: 1px solid #bdc9d1;
-            border-radius: 6px;
-            padding: 10px 12px;
-            font: inherit;
-            background: #ffffff;
-          }}
-          .grid-2 {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px;
-          }}
-          textarea {{
-            min-height: 240px;
-            resize: vertical;
-          }}
-          button {{
-            margin-top: 16px;
-            border: 0;
-            border-radius: 6px;
-            padding: 10px 14px;
-            background: var(--accent);
-            color: white;
-            font-weight: 700;
-            cursor: pointer;
-          }}
-          button:hover {{ background: var(--accent-dark); }}
-          button.secondary {{
-            background: #eef3f5;
-            color: var(--ink);
-            border: 1px solid #c9d4db;
-          }}
-          button.secondary:hover {{ background: #e0e9ed; }}
-          .toolbar {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin: 10px 0;
-          }}
-          .button-link {{
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            margin-top: 16px;
-            border-radius: 6px;
-            padding: 10px 14px;
-            background: var(--accent);
-            color: #ffffff;
-            font-weight: 700;
-            text-decoration: none;
-          }}
-          .button-link:hover {{ background: var(--accent-dark); }}
-          .status {{
-            color: var(--muted);
-            font-size: 13px;
-            min-height: 20px;
-          }}
-          .pill {{
-            display: inline-flex;
-            align-items: center;
-            border-radius: 999px;
-            border: 1px solid var(--line);
-            padding: 3px 9px;
-            font-size: 12px;
-            font-weight: 700;
-            color: var(--muted);
-            white-space: nowrap;
-          }}
-          .pill.ok {{
-            color: var(--ok);
-            border-color: #a6d4ba;
-            background: #eef8f2;
-          }}
-          .notice {{
-            border: 1px solid #cddbd8;
-            border-radius: 8px;
-            background: var(--soft);
-            padding: 10px 12px;
-            margin-top: 12px;
-            font-size: 13px;
-            color: #31404a;
-          }}
-          article {{
-            border-top: 1px solid var(--line);
-            padding: 14px 0;
-          }}
-          article:first-child {{ border-top: 0; padding-top: 0; }}
-          .meta {{
-            color: var(--muted);
-            font-size: 13px;
-            margin: 4px 0 8px;
-          }}
-          .badge {{
-            display: inline-block;
-            border: 1px solid #d6bd7c;
-            color: var(--warn);
-            border-radius: 999px;
-            padding: 2px 8px;
-            font-size: 12px;
-            font-weight: 700;
-          }}
-          dl {{
-            display: grid;
-            grid-template-columns: 130px 1fr;
-            gap: 5px 12px;
-            margin: 10px 0 0;
-            font-size: 14px;
-          }}
-          dt {{ color: var(--muted); }}
-          dd {{ margin: 0; }}
-          @media (max-width: 840px) {{
-            main {{ grid-template-columns: 1fr; }}
-            .grid-2 {{ grid-template-columns: 1fr; }}
-          }}
-        </style>
+        <title>{html.escape(title)}</title>
+        <style>{base_css()}</style>
       </head>
       <body>
         <header>
-          <h1>Accountant Support</h1>
-          <p>Local email processing MVP. Data stays in this local app unless a connector is explicitly enabled.</p>
+          <div>
+            <h1>Accountant Supporter</h1>
+            <p>Local-first bookkeeping workflow connections and processing.</p>
+          </div>
+          {nav}
         </header>
-        <main>
-          <section>
-            <form id="email-form">
-              <h2>Process Email</h2>
-              <label for="subject">Subject</label>
-              <input id="subject" name="subject" value="Invoice INV-1042 from Northstar Office Supply" required />
-              <label for="sender">Sender</label>
-              <input id="sender" name="sender" value="Northstar Office Supply &lt;billing@example.com&gt;" required />
-              <label for="body">Email Body</label>
-              <textarea id="body" name="body" required>Hello,
+        {body}
+      </body>
+    </html>
+    """
+
+
+def index() -> str:
+    body = """
+      <main class="connection-main">
+        <section class="connection-card">
+          <div class="connector-head">
+            <div>
+              <h2>Mail Authentication</h2>
+              <p>Connect Outlook so the app can read selected mailbox messages for summarization.</p>
+            </div>
+            <span class="pill" id="outlook-pill">Checking</span>
+          </div>
+          <div class="toolbar">
+            <a class="button-link" href="/auth/outlook/start">Connect Outlook</a>
+          </div>
+          <div class="status" id="outlook-status">Checking status...</div>
+          <div class="notice" id="outlook-config"></div>
+        </section>
+
+        <section class="connection-card">
+          <div class="connector-head">
+            <div>
+              <h2>Zoho Books Authentication</h2>
+              <p>Connect Zoho Books so approved invoice drafts can be uploaded through the accounting workflow.</p>
+            </div>
+            <span class="pill" id="zoho-pill">Checking</span>
+          </div>
+          <div class="toolbar">
+            <a class="button-link" href="/auth/zoho/start">Connect Zoho Books</a>
+          </div>
+          <div class="status" id="zoho-status">Checking status...</div>
+          <div class="notice" id="zoho-config"></div>
+        </section>
+      </main>
+      <script>
+        async function refreshConnectionStatus() {
+          await Promise.all([refreshOutlookStatus(), refreshZohoStatus()]);
+        }
+
+        async function refreshOutlookStatus() {
+          const response = await fetch('/api/outlook/status');
+          const status = await response.json();
+          const target = document.getElementById('outlook-status');
+          const pill = document.getElementById('outlook-pill');
+          const config = document.getElementById('outlook-config');
+          if (!status.configured) {
+            target.textContent = 'Mail authentication is not configured by the app admin yet.';
+            config.textContent = 'Set OUTLOOK_CLIENT_ID and OUTLOOK_REDIRECT_URI, then restart the server.';
+            pill.textContent = 'Not configured';
+            pill.className = 'pill';
+            return;
+          }
+          config.textContent = `Redirect URI: ${status.settings?.redirect_uri || ''}`;
+          pill.textContent = status.connected ? 'Connected' : 'Configured';
+          pill.className = status.connected ? 'pill ok' : 'pill';
+          target.textContent = status.connected ? 'Outlook is connected' : 'Ready to connect Outlook';
+        }
+
+        async function refreshZohoStatus() {
+          const response = await fetch('/api/zoho/status');
+          const status = await response.json();
+          const target = document.getElementById('zoho-status');
+          const pill = document.getElementById('zoho-pill');
+          const config = document.getElementById('zoho-config');
+          if (!status.configured) {
+            target.textContent = 'Zoho Books authentication is not configured by the app admin yet.';
+            config.textContent = 'Set ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, and ZOHO_REDIRECT_URI, then restart the server.';
+            pill.textContent = 'Not configured';
+            pill.className = 'pill';
+            return;
+          }
+          config.textContent = `Redirect URI: ${status.redirect_uri}`;
+          pill.textContent = status.connected ? 'Connected' : 'Configured';
+          pill.className = status.connected ? 'pill ok' : 'pill';
+          target.textContent = status.connected ? 'Zoho Books is connected' : 'Ready to connect Zoho Books';
+        }
+
+        refreshConnectionStatus();
+      </script>
+    """
+    return page_shell("Accountant Supporter Connections", body, active="home")
+
+
+def processing_page() -> str:
+    records = storage.list_processed_emails()
+    record_items = "\n".join(render_record(record) for record in records)
+    body = f"""
+      <main>
+        <section>
+          <form id="email-form">
+            <h2>Process Email</h2>
+            <label for="subject">Subject</label>
+            <input id="subject" name="subject" value="Invoice INV-1042 from Northstar Office Supply" required />
+            <label for="sender">Sender</label>
+            <input id="sender" name="sender" value="Northstar Office Supply &lt;billing@example.com&gt;" required />
+            <label for="body">Email Body</label>
+            <textarea id="body" name="body" required>Hello,
 
 Please find invoice INV-1042 for office supplies.
 Invoice date: 05/20/2026
@@ -382,113 +323,99 @@ Due date: 06/19/2026
 Amount due: $842.15
 
 Thank you.</textarea>
-              <button type="submit">Process Email</button>
-            </form>
-            <div class="connector">
-              <div class="connector-head">
-                <div>
-                  <h2>Email Summary</h2>
-                  <p>Connect Outlook, read recent messages, and send selected emails into the summary workflow.</p>
-                </div>
-                <span class="pill" id="outlook-pill">Checking</span>
+            <button type="submit">Process Email</button>
+          </form>
+          <div class="connector">
+            <div class="connector-head">
+              <div>
+                <h2>Mail Messages</h2>
+                <p>Fetch connected Outlook messages and send selected emails into the summary workflow.</p>
               </div>
-              <div class="toolbar">
-                <a class="button-link" id="outlook-connect" href="/auth/outlook/start">Connect Outlook</a>
-                <button class="secondary" type="button" id="outlook-fetch">Fetch inbox</button>
-              </div>
-              <div class="status" id="outlook-status">Checking status...</div>
-              <div class="notice" id="outlook-config"></div>
-              <div id="outlook-auth"></div>
-              <div id="outlook-messages"></div>
+              <span class="pill" id="outlook-pill">Checking</span>
             </div>
-          </section>
-          <section class="records">
-            <h2>Recent Results</h2>
-            <div id="records">{record_items or "<p>No processed emails yet.</p>"}</div>
-          </section>
-        </main>
-        <script>
-          let outlookMessages = [];
-          const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
-            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
-          }}[char]));
+            <div class="toolbar">
+              <button class="secondary" type="button" id="outlook-fetch">Fetch inbox</button>
+            </div>
+            <div class="status" id="outlook-status">Checking status...</div>
+            <div id="outlook-messages"></div>
+          </div>
+        </section>
+        <section class="records">
+          <h2>Recent Results</h2>
+          <div id="records">{record_items or "<p>No processed emails yet.</p>"}</div>
+        </section>
+      </main>
+      <script>
+        let outlookMessages = [];
+        const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+        }}[char]));
 
-          const form = document.getElementById('email-form');
-          form.addEventListener('submit', async (event) => {{
-            event.preventDefault();
-            const payload = Object.fromEntries(new FormData(form).entries());
-            const response = await fetch('/api/email-samples/process', {{
-              method: 'POST',
-              headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify(payload)
-            }});
-            if (!response.ok) {{
-              alert('Processing failed');
-              return;
-            }}
-            window.location.reload();
+        document.getElementById('email-form').addEventListener('submit', async (event) => {{
+          event.preventDefault();
+          const payload = Object.fromEntries(new FormData(event.currentTarget).entries());
+          const response = await fetch('/api/email-samples/process', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify(payload)
           }});
-
-          async function outlookStatus() {{
-            const response = await fetch('/api/outlook/status');
-            const status = await response.json();
-            const target = document.getElementById('outlook-status');
-            const pill = document.getElementById('outlook-pill');
-            const config = document.getElementById('outlook-config');
-            if (!status.configured) {{
-              target.textContent = 'Outlook is not configured by the app admin yet.';
-              config.textContent = 'Set OUTLOOK_CLIENT_ID and OUTLOOK_REDIRECT_URI for this local app, then restart the server.';
-              pill.textContent = 'Not configured';
-              pill.className = 'pill';
-              return;
-            }}
-            config.textContent = `Redirect URI: ${{status.settings?.redirect_uri || ''}}`;
-            pill.textContent = status.connected ? 'Connected' : 'Configured';
-            pill.className = status.connected ? 'pill ok' : 'pill';
-            target.textContent = status.connected ? 'Outlook is connected' : 'Ready to connect Outlook';
+          if (!response.ok) {{
+            alert('Processing failed');
+            return;
           }}
+          window.location.reload();
+        }});
 
-          document.getElementById('outlook-fetch').addEventListener('click', async () => {{
-            const response = await fetch('/api/outlook/messages?top=5');
-            const result = await response.json();
-            if (!response.ok) {{
-              document.getElementById('outlook-messages').textContent = result.error || 'Unable to fetch messages';
-              return;
-            }}
-            outlookMessages = result.messages || [];
-            document.getElementById('outlook-messages').innerHTML = outlookMessages.map((message, index) => `
-              <article>
-                <strong>${{escapeHtml(message.subject)}}</strong>
-                <div class="meta">${{escapeHtml(message.sender)}} | ${{escapeHtml(message.received_at || '')}}</div>
-                <p>${{escapeHtml(message.body_preview)}}</p>
-                <button class="secondary" type="button" onclick="processOutlookMessage(${{index}})">Process</button>
-              </article>
-            `).join('') || '<p>No messages found.</p>';
+        async function outlookStatus() {{
+          const response = await fetch('/api/outlook/status');
+          const status = await response.json();
+          const target = document.getElementById('outlook-status');
+          const pill = document.getElementById('outlook-pill');
+          pill.textContent = status.connected ? 'Connected' : 'Not connected';
+          pill.className = status.connected ? 'pill ok' : 'pill';
+          target.textContent = status.connected ? 'Outlook is connected' : 'Connect Outlook on the Connections page first';
+        }}
+
+        document.getElementById('outlook-fetch').addEventListener('click', async () => {{
+          const response = await fetch('/api/outlook/messages?top=5');
+          const result = await response.json();
+          if (!response.ok) {{
+            document.getElementById('outlook-messages').textContent = result.error || 'Unable to fetch messages';
+            return;
+          }}
+          outlookMessages = result.messages || [];
+          document.getElementById('outlook-messages').innerHTML = outlookMessages.map((message, index) => `
+            <article>
+              <strong>${{escapeHtml(message.subject)}}</strong>
+              <div class="meta">${{escapeHtml(message.sender)}} | ${{escapeHtml(message.received_at || '')}}</div>
+              <p>${{escapeHtml(message.body_preview)}}</p>
+              <button class="secondary" type="button" onclick="processOutlookMessage(${{index}})">Process</button>
+            </article>
+          `).join('') || '<p>No messages found.</p>';
+        }});
+
+        async function processOutlookMessage(index) {{
+          const message = outlookMessages[index];
+          const response = await fetch('/api/email-samples/process', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+              subject: message.subject,
+              sender: message.sender,
+              body: message.body || message.body_preview
+            }})
           }});
-
-          async function processOutlookMessage(index) {{
-            const message = outlookMessages[index];
-            const response = await fetch('/api/email-samples/process', {{
-              method: 'POST',
-              headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify({{
-                subject: message.subject,
-                sender: message.sender,
-                body: message.body || message.body_preview
-              }})
-            }});
-            if (!response.ok) {{
-              alert('Processing failed');
-              return;
-            }}
-            window.location.reload();
+          if (!response.ok) {{
+            alert('Processing failed');
+            return;
           }}
+          window.location.reload();
+        }}
 
-          outlookStatus();
-        </script>
-      </body>
-    </html>
+        outlookStatus();
+      </script>
     """
+    return page_shell("Accountant Supporter Processing", body, active="processing")
 
 
 class AccountantSupportHandler(BaseHTTPRequestHandler):
@@ -499,14 +426,20 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_html(index())
             return
+        if path == "/processing":
+            self._send_html(processing_page())
+            return
         if path == "/auth/outlook/start":
-            try:
-                self._redirect(start_outlook_redirect_auth())
-            except Exception as exc:
-                self._send_html(_auth_result_page("Outlook setup needed", str(exc), False), status=HTTPStatus.BAD_REQUEST)
+            self._auth_redirect(start_outlook_redirect_auth, "Mail setup needed")
             return
         if path == "/auth/outlook/callback":
             self._send_html(complete_outlook_redirect_auth(urlparse(self.path).query))
+            return
+        if path == "/auth/zoho/start":
+            self._auth_redirect(start_zoho_redirect_auth, "Zoho Books setup needed")
+            return
+        if path == "/auth/zoho/callback":
+            self._send_html(complete_zoho_redirect_auth(urlparse(self.path).query))
             return
         if path == "/health":
             self._send_json(health())
@@ -530,29 +463,16 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/outlook/status":
             self._send_json(outlook_status())
             return
+        if path == "/api/zoho/status":
+            self._send_json(zoho_status())
+            return
         if path == "/api/outlook/messages":
-            query = urlparse(self.path).query
-            top = 10
-            if query.startswith("top="):
-                try:
-                    top = int(query.split("=", 1)[1])
-                except ValueError:
-                    top = 10
-            try:
-                self._send_json({"messages": list_outlook_messages(top=top)})
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            self._send_outlook_messages()
             return
         self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path == "/api/outlook/settings":
-            try:
-                self._send_json(save_outlook_settings(self._read_json()))
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
         if path == "/api/outlook/auth/start":
             try:
                 self._send_json(start_outlook_auth())
@@ -588,6 +508,28 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
+    def _auth_redirect(self, factory: Any, error_title: str) -> None:
+        try:
+            self._redirect(factory())
+        except Exception as exc:
+            self._send_html(
+                auth_result_page(error_title, str(exc), False),
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+    def _send_outlook_messages(self) -> None:
+        query = urlparse(self.path).query
+        top = 10
+        if query.startswith("top="):
+            try:
+                top = int(query.split("=", 1)[1])
+            except ValueError:
+                top = 10
+        try:
+            self._send_json({"messages": list_outlook_messages(top=top)})
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
     def _read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(content_length).decode("utf-8")
@@ -613,14 +555,13 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _redirect(self, location: str) -> None:
-        body = b""
         self.send_response(HTTPStatus.FOUND)
         self.send_header("Location", location)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
 
-def _render_record(record: ProcessedEmail) -> str:
+def render_record(record: ProcessedEmail) -> str:
     extracted = record.extracted
     review = '<span class="badge">Review required</span>' if extracted.needs_review else ""
     amount = "" if extracted.amount is None else f"{extracted.currency or ''} {extracted.amount:,.2f}"
@@ -643,7 +584,7 @@ def _render_record(record: ProcessedEmail) -> str:
     """
 
 
-def _auth_result_page(title: str, message: str, success: bool) -> str:
+def auth_result_page(title: str, message: str, success: bool) -> str:
     color = "#176b3e" if success else "#8a2700"
     return f"""
     <!doctype html>
@@ -652,39 +593,190 @@ def _auth_result_page(title: str, message: str, success: bool) -> str:
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{html.escape(title)}</title>
-        <style>
-          body {{
-            margin: 0;
-            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            color: #172026;
-            background: #fbfcfd;
-          }}
-          main {{
-            max-width: 680px;
-            margin: 12vh auto 0;
-            padding: 0 24px;
-          }}
-          .panel {{
-            border: 1px solid #d8e0e6;
-            border-radius: 8px;
-            background: white;
-            padding: 24px;
-          }}
-          h1 {{ margin: 0 0 10px; color: {color}; font-size: 24px; }}
-          p {{ color: #61717d; line-height: 1.5; }}
-          a {{ color: #176b5d; font-weight: 700; }}
-        </style>
+        <style>{base_css()}</style>
       </head>
       <body>
-        <main>
-          <div class="panel">
-            <h1>{html.escape(title)}</h1>
+        <main class="auth-result">
+          <section class="connection-card">
+            <h1 style="color: {color}">{html.escape(title)}</h1>
             <p>{html.escape(message)}</p>
-            <p><a href="/">Return to Accountant Supporter</a></p>
-          </div>
+            <p><a href="/">Return to connections</a></p>
+          </section>
         </main>
       </body>
     </html>
+    """
+
+
+def _active(current: str, value: str) -> str:
+    return "active" if current == value else ""
+
+
+def base_css() -> str:
+    return """
+      :root {
+        color-scheme: light;
+        --ink: #172026;
+        --muted: #61717d;
+        --line: #d8e0e6;
+        --panel: #f7f9fb;
+        --soft: #eef4f2;
+        --accent: #176b5d;
+        --accent-dark: #0f4d43;
+        --warn: #8a5a00;
+        --ok: #176b3e;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: #ffffff;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 22px;
+        border-bottom: 1px solid var(--line);
+        padding: 22px clamp(18px, 4vw, 52px);
+        background: #fbfcfd;
+      }
+      nav { display: flex; flex-wrap: wrap; gap: 8px; }
+      nav a {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--ink);
+        padding: 8px 10px;
+        text-decoration: none;
+        font-weight: 700;
+        font-size: 14px;
+      }
+      nav a.active { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+      main {
+        display: grid;
+        grid-template-columns: minmax(360px, 0.92fr) minmax(420px, 1.08fr);
+        gap: 28px;
+        padding: 28px clamp(18px, 4vw, 52px);
+      }
+      .connection-main {
+        grid-template-columns: repeat(2, minmax(320px, 1fr));
+        align-items: start;
+      }
+      .auth-result {
+        display: block;
+        max-width: 720px;
+        margin: 10vh auto 0;
+      }
+      h1 { margin: 0; font-size: 24px; }
+      h2 { margin: 0 0 14px; font-size: 18px; }
+      p { color: var(--muted); line-height: 1.5; }
+      form, .records, .connection-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 18px;
+      }
+      .connector, .connection-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #ffffff;
+        padding: 18px;
+      }
+      .connector { margin-top: 18px; }
+      .connector-head {
+        display: flex;
+        align-items: start;
+        justify-content: space-between;
+        gap: 14px;
+      }
+      .connector-head p { margin: 2px 0 0; font-size: 13px; }
+      label {
+        display: block;
+        margin: 14px 0 6px;
+        color: #31404a;
+        font-weight: 650;
+        font-size: 14px;
+      }
+      input, textarea {
+        width: 100%;
+        border: 1px solid #bdc9d1;
+        border-radius: 6px;
+        padding: 10px 12px;
+        font: inherit;
+        background: #ffffff;
+      }
+      textarea { min-height: 240px; resize: vertical; }
+      button, .button-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        margin-top: 16px;
+        border: 0;
+        border-radius: 6px;
+        padding: 10px 14px;
+        background: var(--accent);
+        color: #ffffff;
+        font-weight: 700;
+        font: inherit;
+        text-decoration: none;
+        cursor: pointer;
+      }
+      button:hover, .button-link:hover { background: var(--accent-dark); }
+      button.secondary {
+        background: #eef3f5;
+        color: var(--ink);
+        border: 1px solid #c9d4db;
+      }
+      button.secondary:hover { background: #e0e9ed; }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+      .status { color: var(--muted); font-size: 13px; min-height: 20px; }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        padding: 3px 9px;
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .pill.ok { color: var(--ok); border-color: #a6d4ba; background: #eef8f2; }
+      .notice {
+        border: 1px solid #cddbd8;
+        border-radius: 8px;
+        background: var(--soft);
+        padding: 10px 12px;
+        margin-top: 12px;
+        font-size: 13px;
+        color: #31404a;
+      }
+      article { border-top: 1px solid var(--line); padding: 14px 0; }
+      article:first-child { border-top: 0; padding-top: 0; }
+      .meta { color: var(--muted); font-size: 13px; margin: 4px 0 8px; }
+      .badge {
+        display: inline-block;
+        border: 1px solid #d6bd7c;
+        color: var(--warn);
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      dl {
+        display: grid;
+        grid-template-columns: 130px 1fr;
+        gap: 5px 12px;
+        margin: 10px 0 0;
+        font-size: 14px;
+      }
+      dt { color: var(--muted); }
+      dd { margin: 0; }
+      @media (max-width: 840px) {
+        header { align-items: stretch; flex-direction: column; }
+        main, .connection-main { grid-template-columns: 1fr; }
+      }
     """
 
 

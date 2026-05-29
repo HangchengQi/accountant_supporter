@@ -14,6 +14,11 @@ services:
       OUTLOOK_TENANT_ID: ${OUTLOOK_TENANT_ID:-common}
       OUTLOOK_SCOPES: ${OUTLOOK_SCOPES:-offline_access User.Read Mail.Read}
       OUTLOOK_REDIRECT_URI: ${OUTLOOK_REDIRECT_URI:-http://127.0.0.1:8080/auth/outlook/callback}
+      ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID:-}
+      ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET:-}
+      ZOHO_SCOPES: ${ZOHO_SCOPES:-ZohoBooks.fullaccess.all}
+      ZOHO_REDIRECT_URI: ${ZOHO_REDIRECT_URI:-http://127.0.0.1:8080/auth/zoho/callback}
+      ZOHO_ACCOUNTS_ROOT: ${ZOHO_ACCOUNTS_ROOT:-https://accounts.zoho.com}
     volumes:
       - ./data:/data
       - ./workflows:/app/workflows:ro
