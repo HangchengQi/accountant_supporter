@@ -102,10 +102,9 @@ $env:ZOHO_CLIENT_ID="your-client-id"
 $env:ZOHO_CLIENT_SECRET="your-client-secret"
 $env:ZOHO_SCOPES="ZohoBooks.fullaccess.all"
 $env:ZOHO_REDIRECT_URI="http://127.0.0.1:8080/auth/zoho/callback"
-$env:ZOHO_ACCOUNTS_ROOT="https://accounts.zoho.com"
 ```
 
-Use a regional `ZOHO_ACCOUNTS_ROOT` such as `https://accounts.zoho.eu` if your Zoho account is hosted outside the US data center.
+This MVP assumes US Zoho accounts and redirects users to `https://accounts.zoho.com`.
 
 ## Next Milestones
 

@@ -22,7 +22,6 @@ class ZohoConfig:
     client_secret: str
     redirect_uri: str
     scopes: str
-    accounts_root: str = ZOHO_ACCOUNTS_ROOT
 
     @classmethod
     def from_env(cls) -> "ZohoConfig":
@@ -34,8 +33,6 @@ class ZohoConfig:
                 "http://127.0.0.1:8080/auth/zoho/callback",
             ).strip(),
             scopes=os.getenv("ZOHO_SCOPES", "ZohoBooks.fullaccess.all").strip(),
-            accounts_root=os.getenv("ZOHO_ACCOUNTS_ROOT", ZOHO_ACCOUNTS_ROOT).strip()
-            or ZOHO_ACCOUNTS_ROOT,
         )
 
     @property
@@ -57,7 +54,7 @@ class ZohoOAuthClient:
             "connected": has_token,
             "scopes": self.config.scopes,
             "redirect_uri": self.config.redirect_uri,
-            "accounts_root": self.config.accounts_root,
+            "login_url": ZOHO_ACCOUNTS_ROOT,
         }
 
     def authorization_url(self, state: str) -> str:
@@ -73,12 +70,12 @@ class ZohoOAuthClient:
                 "prompt": "consent",
             }
         )
-        return f"{self.config.accounts_root}/oauth/v2/auth?{query}"
+        return f"{ZOHO_ACCOUNTS_ROOT}/oauth/v2/auth?{query}"
 
     def exchange_authorization_code(self, code: str) -> dict[str, Any]:
         self._require_config()
         token = self._post_form(
-            f"{self.config.accounts_root}/oauth/v2/token",
+            f"{ZOHO_ACCOUNTS_ROOT}/oauth/v2/token",
             {
                 "code": code,
                 "client_id": self.config.client_id,
@@ -95,7 +92,7 @@ class ZohoOAuthClient:
         if not refresh_token:
             raise ZohoAuthError("missing_refresh_token")
         refreshed = self._post_form(
-            f"{self.config.accounts_root}/oauth/v2/token",
+            f"{ZOHO_ACCOUNTS_ROOT}/oauth/v2/token",
             {
                 "refresh_token": refresh_token,
                 "client_id": self.config.client_id,

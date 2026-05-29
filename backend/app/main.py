@@ -290,7 +290,7 @@ def index() -> str:
             pill.className = 'pill';
             return;
           }
-          config.textContent = `Redirect URI: ${status.redirect_uri}`;
+          config.textContent = `US Zoho login: ${status.login_url} | Redirect URI: ${status.redirect_uri}`;
           pill.textContent = status.connected ? 'Connected' : 'Configured';
           pill.className = status.connected ? 'pill ok' : 'pill';
           target.textContent = status.connected ? 'Zoho Books is connected' : 'Ready to connect Zoho Books';
