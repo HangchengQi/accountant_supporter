@@ -32,6 +32,17 @@ class OutlookConfig:
             ).strip(),
         )
 
+    @classmethod
+    def from_settings(cls, settings: dict[str, Any] | None) -> "OutlookConfig":
+        env_config = cls.from_env()
+        if not settings:
+            return env_config
+        return cls(
+            client_id=str(settings.get("client_id") or env_config.client_id).strip(),
+            tenant_id=str(settings.get("tenant_id") or env_config.tenant_id or "common").strip(),
+            scopes=str(settings.get("scopes") or env_config.scopes).strip(),
+        )
+
     @property
     def is_configured(self) -> bool:
         return bool(self.client_id)

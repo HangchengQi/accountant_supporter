@@ -49,6 +49,15 @@ class SQLiteStorage:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS connector_settings (
+                    provider TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    settings_json TEXT NOT NULL
+                )
+                """
+            )
 
     def save_processed_email(
         self,
@@ -136,6 +145,34 @@ class SQLiteStorage:
         if not row:
             return None
         return json.loads(row["token_json"])
+
+    def save_connector_settings(self, provider: str, settings: dict[str, Any]) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO connector_settings (provider, updated_at, settings_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(provider)
+                DO UPDATE SET updated_at = excluded.updated_at,
+                              settings_json = excluded.settings_json
+                """,
+                (provider, now, json.dumps(settings)),
+            )
+
+    def get_connector_settings(self, provider: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT settings_json
+                FROM connector_settings
+                WHERE provider = ?
+                """,
+                (provider,),
+            ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["settings_json"])
 
     def _row_to_processed_email(self, row: sqlite3.Row) -> ProcessedEmail:
         return ProcessedEmail(

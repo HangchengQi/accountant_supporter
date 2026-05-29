@@ -62,7 +62,13 @@ Cloud mode can be added later by swapping adapters, not by rewriting the workflo
 
 The Outlook connector uses Microsoft Graph device-code sign-in. The local app stores OAuth tokens in the local SQLite database.
 
-Create a Microsoft Entra app registration, enable public-client/native authentication, and set these environment values:
+Create a Microsoft Entra app registration and enable public-client/native authentication. In the local app, open the Outlook panel and save:
+
+- Client ID
+- Tenant ID, or `common`
+- Scopes, normally `offline_access User.Read Mail.Read`
+
+Environment variables are still supported for scripted local installs:
 
 ```powershell
 $env:OUTLOOK_CLIENT_ID="your-client-id"

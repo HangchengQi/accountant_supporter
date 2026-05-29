@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .ai import LocalHeuristicProcessor
-from .outlook import DeviceCodeSession, OutlookGraphClient
+from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
 from .schemas import EmailSampleIn, ProcessedEmail
 from .storage import SQLiteStorage
 from .workflow import Workflow, load_workflow
@@ -28,7 +28,6 @@ def get_workflow_path() -> str:
 storage = SQLiteStorage(get_database_path())
 ai_processor = LocalHeuristicProcessor()
 zoho_client = DryRunZohoBooksClient()
-outlook_client = OutlookGraphClient()
 pending_outlook_auth: DeviceCodeSession | None = None
 
 
@@ -62,12 +61,47 @@ def list_processed_emails() -> list[ProcessedEmail]:
     return storage.list_processed_emails()
 
 
+def get_outlook_client() -> OutlookGraphClient:
+    return OutlookGraphClient(
+        OutlookConfig.from_settings(storage.get_connector_settings("outlook"))
+    )
+
+
 def outlook_status() -> dict[str, Any]:
-    return outlook_client.configured_status(has_token=storage.get_oauth_token("outlook") is not None)
+    settings = storage.get_connector_settings("outlook") or {}
+    client = get_outlook_client()
+    status = client.configured_status(has_token=storage.get_oauth_token("outlook") is not None)
+    status["settings"] = {
+        "client_id": client.config.client_id,
+        "tenant_id": client.config.tenant_id,
+        "scopes": client.config.scopes,
+        "saved_locally": bool(settings),
+    }
+    return status
+
+
+def save_outlook_settings(data: dict[str, Any]) -> dict[str, Any]:
+    client_id = str(data.get("client_id", "")).strip()
+    tenant_id = str(data.get("tenant_id", "common")).strip() or "common"
+    scopes = str(data.get("scopes", "offline_access User.Read Mail.Read")).strip()
+    if not client_id:
+        raise ValueError("client_id is required")
+    if not scopes:
+        raise ValueError("scopes are required")
+    storage.save_connector_settings(
+        "outlook",
+        {
+            "client_id": client_id,
+            "tenant_id": tenant_id,
+            "scopes": scopes,
+        },
+    )
+    return outlook_status()
 
 
 def start_outlook_auth() -> dict[str, Any]:
     global pending_outlook_auth
+    outlook_client = get_outlook_client()
     pending_outlook_auth = outlook_client.start_device_code()
     return pending_outlook_auth.to_dict()
 
@@ -76,6 +110,7 @@ def poll_outlook_auth() -> dict[str, Any]:
     global pending_outlook_auth
     if pending_outlook_auth is None:
         return {"status": "not_started"}
+    outlook_client = get_outlook_client()
     result = outlook_client.poll_device_code(pending_outlook_auth)
     if result.get("status") == "connected":
         storage.save_oauth_token("outlook", result["token"])
@@ -88,6 +123,7 @@ def get_outlook_token() -> dict[str, Any]:
     if not token:
         raise ValueError("Outlook is not connected")
     if float(token.get("expires_at", 0)) <= time.time() + 60:
+        outlook_client = get_outlook_client()
         token = outlook_client.refresh_token(token)
         storage.save_oauth_token("outlook", token)
     return token
@@ -95,6 +131,7 @@ def get_outlook_token() -> dict[str, Any]:
 
 def list_outlook_messages(top: int = 10) -> list[dict[str, Any]]:
     token = get_outlook_token()
+    outlook_client = get_outlook_client()
     return [
         message.to_dict()
         for message in outlook_client.list_inbox_messages(token=token, top=top)
@@ -118,9 +155,11 @@ def index() -> str:
             --muted: #61717d;
             --line: #d8e0e6;
             --panel: #f7f9fb;
+            --soft: #eef4f2;
             --accent: #176b5d;
             --accent-dark: #0f4d43;
             --warn: #8a5a00;
+            --ok: #176b3e;
           }}
           * {{ box-sizing: border-box; }}
           body {{
@@ -131,16 +170,18 @@ def index() -> str:
           }}
           header {{
             border-bottom: 1px solid var(--line);
-            padding: 20px clamp(18px, 4vw, 52px);
+            padding: 22px clamp(18px, 4vw, 52px);
+            background: #fbfcfd;
           }}
           main {{
             display: grid;
-            grid-template-columns: minmax(320px, 0.9fr) minmax(360px, 1.1fr);
+            grid-template-columns: minmax(360px, 0.92fr) minmax(420px, 1.08fr);
             gap: 28px;
             padding: 28px clamp(18px, 4vw, 52px);
           }}
           h1 {{ margin: 0; font-size: 24px; }}
           h2 {{ margin: 0 0 14px; font-size: 18px; }}
+          h3 {{ margin: 18px 0 10px; font-size: 14px; color: #31404a; }}
           p {{ color: var(--muted); line-height: 1.5; }}
           form, .records {{
             border: 1px solid var(--line);
@@ -155,6 +196,13 @@ def index() -> str:
             margin-top: 18px;
             padding: 18px;
           }}
+          .connector-head {{
+            display: flex;
+            align-items: start;
+            justify-content: space-between;
+            gap: 14px;
+          }}
+          .connector-head p {{ margin: 2px 0 0; font-size: 13px; }}
           label {{
             display: block;
             margin: 14px 0 6px;
@@ -169,6 +217,11 @@ def index() -> str:
             padding: 10px 12px;
             font: inherit;
             background: #ffffff;
+          }}
+          .grid-2 {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
           }}
           textarea {{
             min-height: 240px;
@@ -202,6 +255,31 @@ def index() -> str:
             font-size: 13px;
             min-height: 20px;
           }}
+          .pill {{
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            padding: 3px 9px;
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--muted);
+            white-space: nowrap;
+          }}
+          .pill.ok {{
+            color: var(--ok);
+            border-color: #a6d4ba;
+            background: #eef8f2;
+          }}
+          .notice {{
+            border: 1px solid #cddbd8;
+            border-radius: 8px;
+            background: var(--soft);
+            padding: 10px 12px;
+            margin-top: 12px;
+            font-size: 13px;
+            color: #31404a;
+          }}
           article {{
             border-top: 1px solid var(--line);
             padding: 14px 0;
@@ -232,6 +310,7 @@ def index() -> str:
           dd {{ margin: 0; }}
           @media (max-width: 840px) {{
             main {{ grid-template-columns: 1fr; }}
+            .grid-2 {{ grid-template-columns: 1fr; }}
           }}
         </style>
       </head>
@@ -260,13 +339,33 @@ Thank you.</textarea>
               <button type="submit">Process Email</button>
             </form>
             <div class="connector">
-              <h2>Outlook</h2>
-              <div class="status" id="outlook-status">Checking status...</div>
+              <div class="connector-head">
+                <div>
+                  <h2>Outlook</h2>
+                  <p>Microsoft Graph device-code sign-in with local token storage.</p>
+                </div>
+                <span class="pill" id="outlook-pill">Checking</span>
+              </div>
+              <h3>Connection Settings</h3>
+              <div class="grid-2">
+                <div>
+                  <label for="outlook-client-id">Client ID</label>
+                  <input id="outlook-client-id" autocomplete="off" placeholder="Application client ID" />
+                </div>
+                <div>
+                  <label for="outlook-tenant-id">Tenant ID</label>
+                  <input id="outlook-tenant-id" autocomplete="off" placeholder="common or tenant ID" />
+                </div>
+              </div>
+              <label for="outlook-scopes">Scopes</label>
+              <input id="outlook-scopes" autocomplete="off" value="offline_access User.Read Mail.Read" />
               <div class="toolbar">
+                <button type="button" id="outlook-save">Save settings</button>
                 <button class="secondary" type="button" id="outlook-start">Start sign-in</button>
                 <button class="secondary" type="button" id="outlook-poll">Check sign-in</button>
                 <button class="secondary" type="button" id="outlook-fetch">Fetch inbox</button>
               </div>
+              <div class="status" id="outlook-status">Checking status...</div>
               <div id="outlook-auth"></div>
               <div id="outlook-messages"></div>
             </div>
@@ -302,12 +401,41 @@ Thank you.</textarea>
             const response = await fetch('/api/outlook/status');
             const status = await response.json();
             const target = document.getElementById('outlook-status');
+            const pill = document.getElementById('outlook-pill');
+            document.getElementById('outlook-client-id').value = status.settings?.client_id || '';
+            document.getElementById('outlook-tenant-id').value = status.settings?.tenant_id || 'common';
+            document.getElementById('outlook-scopes').value = status.settings?.scopes || 'offline_access User.Read Mail.Read';
             if (!status.configured) {{
-              target.textContent = 'Set OUTLOOK_CLIENT_ID before signing in.';
+              target.textContent = 'Save the Microsoft app client ID before signing in.';
+              pill.textContent = 'Not configured';
+              pill.className = 'pill';
               return;
             }}
+            pill.textContent = status.connected ? 'Connected' : 'Configured';
+            pill.className = status.connected ? 'pill ok' : 'pill';
             target.textContent = status.connected ? 'Connected' : 'Ready to sign in';
           }}
+
+          document.getElementById('outlook-save').addEventListener('click', async () => {{
+            const payload = {{
+              client_id: document.getElementById('outlook-client-id').value,
+              tenant_id: document.getElementById('outlook-tenant-id').value,
+              scopes: document.getElementById('outlook-scopes').value
+            }};
+            const response = await fetch('/api/outlook/settings', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify(payload)
+            }});
+            const result = await response.json();
+            const target = document.getElementById('outlook-status');
+            if (!response.ok) {{
+              target.textContent = result.error || 'Unable to save settings';
+              return;
+            }}
+            target.textContent = 'Settings saved locally';
+            await outlookStatus();
+          }});
 
           document.getElementById('outlook-start').addEventListener('click', async () => {{
             const response = await fetch('/api/outlook/auth/start', {{ method: 'POST' }});
@@ -317,7 +445,7 @@ Thank you.</textarea>
               return;
             }}
             document.getElementById('outlook-auth').innerHTML = `
-              <p>${{escapeHtml(result.message || 'Open Microsoft sign-in and enter the code.')}}</p>
+              <div class="notice">${{escapeHtml(result.message || 'Open Microsoft sign-in and enter the code.')}}</div>
               <dl>
                 <dt>Code</dt><dd>${{escapeHtml(result.user_code)}}</dd>
                 <dt>URL</dt><dd><a href="${{escapeHtml(result.verification_uri)}}" target="_blank">${{escapeHtml(result.verification_uri)}}</a></dd>
@@ -422,6 +550,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/outlook/settings":
+            try:
+                self._send_json(save_outlook_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/outlook/auth/start":
             try:
                 self._send_json(start_outlook_auth())
