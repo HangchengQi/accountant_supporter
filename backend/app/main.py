@@ -247,7 +247,7 @@ def index() -> str:
             <span class="pill" id="zoho-pill">Checking</span>
           </div>
           <div class="toolbar">
-            <a class="button-link" href="/auth/zoho/start">Connect Zoho Books</a>
+            <a class="button-link" id="zoho-connect" href="/auth/zoho/start">Connect Zoho Books</a>
           </div>
           <div class="status" id="zoho-status">Checking status...</div>
           <div class="notice" id="zoho-config"></div>
@@ -283,13 +283,20 @@ def index() -> str:
           const target = document.getElementById('zoho-status');
           const pill = document.getElementById('zoho-pill');
           const config = document.getElementById('zoho-config');
+          const connect = document.getElementById('zoho-connect');
           if (!status.configured) {
             target.textContent = 'Zoho Books authentication is not configured by the app admin yet.';
             config.textContent = 'Set ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, and ZOHO_REDIRECT_URI, then restart the server.';
             pill.textContent = 'Not configured';
             pill.className = 'pill';
+            connect.removeAttribute('href');
+            connect.setAttribute('aria-disabled', 'true');
+            connect.className = 'button-link disabled';
             return;
           }
+          connect.setAttribute('href', '/auth/zoho/start');
+          connect.removeAttribute('aria-disabled');
+          connect.className = 'button-link';
           config.textContent = `US Zoho login: ${status.login_url} | Redirect URI: ${status.redirect_uri}`;
           pill.textContent = status.connected ? 'Connected' : 'Configured';
           pill.className = status.connected ? 'pill ok' : 'pill';
@@ -723,6 +730,12 @@ def base_css() -> str:
         cursor: pointer;
       }
       button:hover, .button-link:hover { background: var(--accent-dark); }
+      .button-link.disabled {
+        background: #d8e0e6;
+        color: #61717d;
+        cursor: not-allowed;
+        pointer-events: none;
+      }
       button.secondary {
         background: #eef3f5;
         color: var(--ink);
