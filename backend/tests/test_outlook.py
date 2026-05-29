@@ -25,12 +25,32 @@ class OutlookConfigTest(unittest.TestCase):
                 "client_id": "abc-123",
                 "tenant_id": "tenant-456",
                 "scopes": "offline_access User.Read Mail.Read",
+                "client_secret": "secret-value",
+                "redirect_uri": "http://127.0.0.1:8080/auth/outlook/callback",
             }
         )
 
         self.assertTrue(config.is_configured)
         self.assertEqual(config.client_id, "abc-123")
         self.assertEqual(config.tenant_id, "tenant-456")
+        self.assertEqual(config.client_secret, "secret-value")
+
+    def test_authorization_url_points_to_microsoft_login(self) -> None:
+        client = OutlookGraphClient(
+            OutlookConfig(
+                client_id="abc-123",
+                tenant_id="tenant-456",
+                scopes="offline_access User.Read Mail.Read",
+                redirect_uri="http://127.0.0.1:8080/auth/outlook/callback",
+            )
+        )
+
+        url = client.authorization_url("state-value")
+
+        self.assertTrue(url.startswith("https://login.microsoftonline.com/tenant-456/"))
+        self.assertIn("response_type=code", url)
+        self.assertIn("client_id=abc-123", url)
+        self.assertIn("state=state-value", url)
 
 
 if __name__ == "__main__":

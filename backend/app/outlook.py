@@ -20,6 +20,8 @@ class OutlookConfig:
     client_id: str
     tenant_id: str
     scopes: str
+    client_secret: str = ""
+    redirect_uri: str = "http://127.0.0.1:8080/auth/outlook/callback"
 
     @classmethod
     def from_env(cls) -> "OutlookConfig":
@@ -29,6 +31,11 @@ class OutlookConfig:
             scopes=os.getenv(
                 "OUTLOOK_SCOPES",
                 "offline_access User.Read Mail.Read",
+            ).strip(),
+            client_secret=os.getenv("OUTLOOK_CLIENT_SECRET", "").strip(),
+            redirect_uri=os.getenv(
+                "OUTLOOK_REDIRECT_URI",
+                "http://127.0.0.1:8080/auth/outlook/callback",
             ).strip(),
         )
 
@@ -41,6 +48,8 @@ class OutlookConfig:
             client_id=str(settings.get("client_id") or env_config.client_id).strip(),
             tenant_id=str(settings.get("tenant_id") or env_config.tenant_id or "common").strip(),
             scopes=str(settings.get("scopes") or env_config.scopes).strip(),
+            client_secret=str(settings.get("client_secret") or env_config.client_secret).strip(),
+            redirect_uri=str(settings.get("redirect_uri") or env_config.redirect_uri).strip(),
         )
 
     @property
@@ -94,7 +103,35 @@ class OutlookGraphClient:
             "connected": has_token,
             "tenant_id": self.config.tenant_id,
             "scopes": self.config.scopes,
+            "redirect_uri": self.config.redirect_uri,
         }
+
+    def authorization_url(self, state: str) -> str:
+        self._require_config()
+        query = urlencode(
+            {
+                "client_id": self.config.client_id,
+                "response_type": "code",
+                "redirect_uri": self.config.redirect_uri,
+                "response_mode": "query",
+                "scope": self.config.scopes,
+                "state": state,
+            }
+        )
+        return f"{self._auth_url('authorize')}?{query}"
+
+    def exchange_authorization_code(self, code: str) -> dict[str, Any]:
+        self._require_config()
+        payload = {
+            "grant_type": "authorization_code",
+            "client_id": self.config.client_id,
+            "code": code,
+            "redirect_uri": self.config.redirect_uri,
+            "scope": self.config.scopes,
+        }
+        if self.config.client_secret:
+            payload["client_secret"] = self.config.client_secret
+        return self._with_expiry(self._post_form(self._auth_url("token"), payload))
 
     def start_device_code(self) -> DeviceCodeSession:
         self._require_config()
@@ -142,12 +179,14 @@ class OutlookGraphClient:
             raise OutlookAuthError("missing_refresh_token")
         refreshed = self._post_form(
             self._auth_url("token"),
-            {
-                "grant_type": "refresh_token",
-                "client_id": self.config.client_id,
-                "refresh_token": refresh_token,
-                "scope": self.config.scopes,
-            },
+            self._with_optional_secret(
+                {
+                    "grant_type": "refresh_token",
+                    "client_id": self.config.client_id,
+                    "refresh_token": refresh_token,
+                    "scope": self.config.scopes,
+                }
+            ),
         )
         if "refresh_token" not in refreshed:
             refreshed["refresh_token"] = refresh_token
@@ -203,6 +242,12 @@ class OutlookGraphClient:
             method="POST",
         )
         return self._open_json(request)
+
+    def _with_optional_secret(self, data: dict[str, str]) -> dict[str, str]:
+        result = dict(data)
+        if self.config.client_secret:
+            result["client_secret"] = self.config.client_secret
+        return result
 
     def _open_json(self, request: Request) -> dict[str, Any]:
         try:

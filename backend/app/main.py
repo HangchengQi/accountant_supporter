@@ -3,11 +3,12 @@ from __future__ import annotations
 import html
 import json
 import os
+import secrets
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .ai import LocalHeuristicProcessor
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
@@ -29,6 +30,7 @@ storage = SQLiteStorage(get_database_path())
 ai_processor = LocalHeuristicProcessor()
 zoho_client = DryRunZohoBooksClient()
 pending_outlook_auth: DeviceCodeSession | None = None
+pending_outlook_state: str | None = None
 
 
 def health() -> dict[str, str]:
@@ -72,9 +74,9 @@ def outlook_status() -> dict[str, Any]:
     client = get_outlook_client()
     status = client.configured_status(has_token=storage.get_oauth_token("outlook") is not None)
     status["settings"] = {
-        "client_id": client.config.client_id,
         "tenant_id": client.config.tenant_id,
         "scopes": client.config.scopes,
+        "redirect_uri": client.config.redirect_uri,
         "saved_locally": bool(settings),
     }
     return status
@@ -97,6 +99,37 @@ def save_outlook_settings(data: dict[str, Any]) -> dict[str, Any]:
         },
     )
     return outlook_status()
+
+
+def start_outlook_redirect_auth() -> str:
+    global pending_outlook_state
+    outlook_client = get_outlook_client()
+    pending_outlook_state = secrets.token_urlsafe(24)
+    return outlook_client.authorization_url(pending_outlook_state)
+
+
+def complete_outlook_redirect_auth(query: str) -> str:
+    global pending_outlook_state
+    params = parse_qs(query)
+    if "error" in params:
+        description = params.get("error_description", params["error"])[0]
+        return _auth_result_page("Outlook connection failed", description, False)
+    code = params.get("code", [""])[0]
+    state = params.get("state", [""])[0]
+    if not code:
+        return _auth_result_page("Outlook connection failed", "Missing authorization code.", False)
+    if not pending_outlook_state or state != pending_outlook_state:
+        return _auth_result_page("Outlook connection failed", "Invalid authorization state.", False)
+
+    outlook_client = get_outlook_client()
+    token = outlook_client.exchange_authorization_code(code)
+    storage.save_oauth_token("outlook", token)
+    pending_outlook_state = None
+    return _auth_result_page(
+        "Outlook connected",
+        "You can close this tab and return to Accountant Supporter.",
+        True,
+    )
 
 
 def start_outlook_auth() -> dict[str, Any]:
@@ -250,6 +283,19 @@ def index() -> str:
             gap: 8px;
             margin: 10px 0;
           }}
+          .button-link {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-top: 16px;
+            border-radius: 6px;
+            padding: 10px 14px;
+            background: var(--accent);
+            color: #ffffff;
+            font-weight: 700;
+            text-decoration: none;
+          }}
+          .button-link:hover {{ background: var(--accent-dark); }}
           .status {{
             color: var(--muted);
             font-size: 13px;
@@ -341,31 +387,17 @@ Thank you.</textarea>
             <div class="connector">
               <div class="connector-head">
                 <div>
-                  <h2>Outlook</h2>
-                  <p>Microsoft Graph device-code sign-in with local token storage.</p>
+                  <h2>Email Summary</h2>
+                  <p>Connect Outlook, read recent messages, and send selected emails into the summary workflow.</p>
                 </div>
                 <span class="pill" id="outlook-pill">Checking</span>
               </div>
-              <h3>Connection Settings</h3>
-              <div class="grid-2">
-                <div>
-                  <label for="outlook-client-id">Client ID</label>
-                  <input id="outlook-client-id" autocomplete="off" placeholder="Application client ID" />
-                </div>
-                <div>
-                  <label for="outlook-tenant-id">Tenant ID</label>
-                  <input id="outlook-tenant-id" autocomplete="off" placeholder="common or tenant ID" />
-                </div>
-              </div>
-              <label for="outlook-scopes">Scopes</label>
-              <input id="outlook-scopes" autocomplete="off" value="offline_access User.Read Mail.Read" />
               <div class="toolbar">
-                <button type="button" id="outlook-save">Save settings</button>
-                <button class="secondary" type="button" id="outlook-start">Start sign-in</button>
-                <button class="secondary" type="button" id="outlook-poll">Check sign-in</button>
+                <a class="button-link" id="outlook-connect" href="/auth/outlook/start">Connect Outlook</a>
                 <button class="secondary" type="button" id="outlook-fetch">Fetch inbox</button>
               </div>
               <div class="status" id="outlook-status">Checking status...</div>
+              <div class="notice" id="outlook-config"></div>
               <div id="outlook-auth"></div>
               <div id="outlook-messages"></div>
             </div>
@@ -402,63 +434,19 @@ Thank you.</textarea>
             const status = await response.json();
             const target = document.getElementById('outlook-status');
             const pill = document.getElementById('outlook-pill');
-            document.getElementById('outlook-client-id').value = status.settings?.client_id || '';
-            document.getElementById('outlook-tenant-id').value = status.settings?.tenant_id || 'common';
-            document.getElementById('outlook-scopes').value = status.settings?.scopes || 'offline_access User.Read Mail.Read';
+            const config = document.getElementById('outlook-config');
             if (!status.configured) {{
-              target.textContent = 'Save the Microsoft app client ID before signing in.';
+              target.textContent = 'Outlook is not configured by the app admin yet.';
+              config.textContent = 'Set OUTLOOK_CLIENT_ID and OUTLOOK_REDIRECT_URI for this local app, then restart the server.';
               pill.textContent = 'Not configured';
               pill.className = 'pill';
               return;
             }}
+            config.textContent = `Redirect URI: ${{status.settings?.redirect_uri || ''}}`;
             pill.textContent = status.connected ? 'Connected' : 'Configured';
             pill.className = status.connected ? 'pill ok' : 'pill';
-            target.textContent = status.connected ? 'Connected' : 'Ready to sign in';
+            target.textContent = status.connected ? 'Outlook is connected' : 'Ready to connect Outlook';
           }}
-
-          document.getElementById('outlook-save').addEventListener('click', async () => {{
-            const payload = {{
-              client_id: document.getElementById('outlook-client-id').value,
-              tenant_id: document.getElementById('outlook-tenant-id').value,
-              scopes: document.getElementById('outlook-scopes').value
-            }};
-            const response = await fetch('/api/outlook/settings', {{
-              method: 'POST',
-              headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify(payload)
-            }});
-            const result = await response.json();
-            const target = document.getElementById('outlook-status');
-            if (!response.ok) {{
-              target.textContent = result.error || 'Unable to save settings';
-              return;
-            }}
-            target.textContent = 'Settings saved locally';
-            await outlookStatus();
-          }});
-
-          document.getElementById('outlook-start').addEventListener('click', async () => {{
-            const response = await fetch('/api/outlook/auth/start', {{ method: 'POST' }});
-            const result = await response.json();
-            if (!response.ok) {{
-              document.getElementById('outlook-auth').textContent = result.error || 'Unable to start sign-in';
-              return;
-            }}
-            document.getElementById('outlook-auth').innerHTML = `
-              <div class="notice">${{escapeHtml(result.message || 'Open Microsoft sign-in and enter the code.')}}</div>
-              <dl>
-                <dt>Code</dt><dd>${{escapeHtml(result.user_code)}}</dd>
-                <dt>URL</dt><dd><a href="${{escapeHtml(result.verification_uri)}}" target="_blank">${{escapeHtml(result.verification_uri)}}</a></dd>
-              </dl>
-            `;
-          }});
-
-          document.getElementById('outlook-poll').addEventListener('click', async () => {{
-            const response = await fetch('/api/outlook/auth/poll', {{ method: 'POST' }});
-            const result = await response.json();
-            document.getElementById('outlook-auth').textContent = result.status || result.error || 'No status';
-            await outlookStatus();
-          }});
 
           document.getElementById('outlook-fetch').addEventListener('click', async () => {{
             const response = await fetch('/api/outlook/messages?top=5');
@@ -510,6 +498,15 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/":
             self._send_html(index())
+            return
+        if path == "/auth/outlook/start":
+            try:
+                self._redirect(start_outlook_redirect_auth())
+            except Exception as exc:
+                self._send_html(_auth_result_page("Outlook setup needed", str(exc), False), status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/auth/outlook/callback":
+            self._send_html(complete_outlook_redirect_auth(urlparse(self.path).query))
             return
         if path == "/health":
             self._send_json(health())
@@ -615,6 +612,13 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _redirect(self, location: str) -> None:
+        body = b""
+        self.send_response(HTTPStatus.FOUND)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
 
 def _render_record(record: ProcessedEmail) -> str:
     extracted = record.extracted
@@ -636,6 +640,51 @@ def _render_record(record: ProcessedEmail) -> str:
           <dt>Confidence</dt><dd>{extracted.confidence:.2f}</dd>
         </dl>
       </article>
+    """
+
+
+def _auth_result_page(title: str, message: str, success: bool) -> str:
+    color = "#176b3e" if success else "#8a2700"
+    return f"""
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{html.escape(title)}</title>
+        <style>
+          body {{
+            margin: 0;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #172026;
+            background: #fbfcfd;
+          }}
+          main {{
+            max-width: 680px;
+            margin: 12vh auto 0;
+            padding: 0 24px;
+          }}
+          .panel {{
+            border: 1px solid #d8e0e6;
+            border-radius: 8px;
+            background: white;
+            padding: 24px;
+          }}
+          h1 {{ margin: 0 0 10px; color: {color}; font-size: 24px; }}
+          p {{ color: #61717d; line-height: 1.5; }}
+          a {{ color: #176b5d; font-weight: 700; }}
+        </style>
+      </head>
+      <body>
+        <main>
+          <div class="panel">
+            <h1>{html.escape(title)}</h1>
+            <p>{html.escape(message)}</p>
+            <p><a href="/">Return to Accountant Supporter</a></p>
+          </div>
+        </main>
+      </body>
+    </html>
     """
 
 

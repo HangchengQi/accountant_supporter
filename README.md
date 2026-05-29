@@ -60,20 +60,22 @@ Cloud mode can be added later by swapping adapters, not by rewriting the workflo
 
 ## Outlook Connector
 
-The Outlook connector uses Microsoft Graph device-code sign-in. The local app stores OAuth tokens in the local SQLite database.
+The Outlook connector uses Microsoft Graph OAuth redirect sign-in. The local app stores OAuth tokens in the local SQLite database.
 
-Create a Microsoft Entra app registration and enable public-client/native authentication. In the local app, open the Outlook panel and save:
+Create a Microsoft Entra app registration and add this redirect URI:
 
-- Client ID
-- Tenant ID, or `common`
-- Scopes, normally `offline_access User.Read Mail.Read`
+```text
+http://127.0.0.1:8080/auth/outlook/callback
+```
 
-Environment variables are still supported for scripted local installs:
+Then set these environment values before starting the local server:
 
 ```powershell
 $env:OUTLOOK_CLIENT_ID="your-client-id"
+$env:OUTLOOK_CLIENT_SECRET="your-client-secret"
 $env:OUTLOOK_TENANT_ID="common"
 $env:OUTLOOK_SCOPES="offline_access User.Read Mail.Read"
+$env:OUTLOOK_REDIRECT_URI="http://127.0.0.1:8080/auth/outlook/callback"
 ```
 
 Then run:
@@ -83,7 +85,7 @@ cd accountant_supporter\backend
 python -m app.main
 ```
 
-Open `http://localhost:8080`, use the Outlook panel to start sign-in, enter the device code in Microsoft, check sign-in, then fetch recent inbox messages.
+Open `http://localhost:8080`, use the Email Summary panel to connect Outlook, then fetch recent inbox messages.
 
 ## Next Milestones
 
