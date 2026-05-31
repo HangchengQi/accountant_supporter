@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .ai import LocalHeuristicProcessor
+from .ai import ai_status, create_ai_processor
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
 from .schemas import EmailSampleIn, ProcessedEmail
 from .storage import SQLiteStorage
@@ -27,7 +27,6 @@ def get_workflow_path() -> str:
 
 
 storage = SQLiteStorage(get_database_path())
-ai_processor = LocalHeuristicProcessor()
 zoho_client = DryRunZohoBooksClient()
 pending_outlook_auth: DeviceCodeSession | None = None
 pending_outlook_state: str | None = None
@@ -44,6 +43,7 @@ def active_workflow() -> Workflow:
 
 def process_email_sample(email: EmailSampleIn) -> ProcessedEmail:
     workflow = load_workflow(get_workflow_path())
+    ai_processor = create_ai_processor()
     ai_result = ai_processor.process(email, workflow)
     zoho_status, zoho_payload = zoho_client.create_draft_from_email(
         email,
@@ -346,6 +346,17 @@ Thank you.</textarea>
             <div class="status" id="outlook-status">Checking status...</div>
             <div id="outlook-messages"></div>
           </div>
+          <div class="connector">
+            <div class="connector-head">
+              <div>
+                <h2>ChatGPT Processing</h2>
+                <p>Use OpenAI for structured summaries and invoice-field extraction when configured.</p>
+              </div>
+              <span class="pill" id="ai-pill">Checking</span>
+            </div>
+            <div class="status" id="ai-status">Checking status...</div>
+            <div class="notice" id="ai-config"></div>
+          </div>
         </section>
         <section class="records">
           <h2>Recent Results</h2>
@@ -381,6 +392,25 @@ Thank you.</textarea>
           pill.textContent = status.connected ? 'Connected' : 'Not connected';
           pill.className = status.connected ? 'pill ok' : 'pill';
           target.textContent = status.connected ? 'Outlook is connected' : 'Connect Outlook on the Connections page first';
+        }}
+
+        async function aiStatus() {{
+          const response = await fetch('/api/ai/status');
+          const status = await response.json();
+          const target = document.getElementById('ai-status');
+          const pill = document.getElementById('ai-pill');
+          const config = document.getElementById('ai-config');
+          if (status.active_provider === 'openai') {{
+            pill.textContent = 'OpenAI';
+            pill.className = 'pill ok';
+            target.textContent = 'ChatGPT/OpenAI processing is active';
+            config.textContent = `Model: ${{status.model}}`;
+            return;
+          }}
+          pill.textContent = 'Local';
+          pill.className = 'pill';
+          target.textContent = 'Using local heuristic processing';
+          config.textContent = 'Set AI_PROVIDER=openai and OPENAI_API_KEY to enable ChatGPT processing.';
         }}
 
         document.getElementById('outlook-fetch').addEventListener('click', async () => {{
@@ -420,6 +450,7 @@ Thank you.</textarea>
         }}
 
         outlookStatus();
+        aiStatus();
       </script>
     """
     return page_shell("Accountant Supporter Processing", body, active="processing")
@@ -472,6 +503,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/zoho/status":
             self._send_json(zoho_status())
+            return
+        if path == "/api/ai/status":
+            self._send_json(ai_status())
             return
         if path == "/api/outlook/messages":
             self._send_outlook_messages()

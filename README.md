@@ -106,10 +106,22 @@ $env:ZOHO_REDIRECT_URI="http://127.0.0.1:8080/auth/zoho/callback"
 
 This MVP assumes US Zoho accounts and redirects users to `https://accounts.zoho.com`.
 
+## ChatGPT Processing
+
+By default, the app uses a local heuristic processor. To use ChatGPT/OpenAI for email summaries and structured invoice extraction, set:
+
+```powershell
+$env:AI_PROVIDER="openai"
+$env:OPENAI_API_KEY="your-openai-api-key"
+$env:OPENAI_MODEL="gpt-5.2"
+```
+
+Then restart the local server. The Processing page shows whether the active processor is local or OpenAI.
+
 ## Next Milestones
 
-1. Add Zoho Books OAuth and create draft bills/invoices.
-2. Add OpenAI structured extraction behind the `AIProcessor` adapter.
+1. Create real Zoho Books draft bills/invoices from approved payloads.
+2. Add tenant/user isolation for multi-user cloud mode.
 3. Add Gmail as a second mail connector.
 4. Add signed workflow package updates.
 5. Add review/approval states before Zoho writes.
