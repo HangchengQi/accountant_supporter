@@ -252,10 +252,22 @@ def index() -> str:
           <div class="status" id="zoho-status">Checking status...</div>
           <div class="notice" id="zoho-config"></div>
         </section>
+
+        <section class="connection-card">
+          <div class="connector-head">
+            <div>
+              <h2>ChatGPT Processing</h2>
+              <p>Connect OpenAI so summaries and invoice-field extraction use ChatGPT.</p>
+            </div>
+            <span class="pill" id="ai-pill">Checking</span>
+          </div>
+          <div class="status" id="ai-status">Checking status...</div>
+          <div class="notice" id="ai-config"></div>
+        </section>
       </main>
       <script>
         async function refreshConnectionStatus() {
-          await Promise.all([refreshOutlookStatus(), refreshZohoStatus()]);
+          await Promise.all([refreshOutlookStatus(), refreshZohoStatus(), refreshAIStatus()]);
         }
 
         async function refreshOutlookStatus() {
@@ -303,6 +315,25 @@ def index() -> str:
           target.textContent = status.connected ? 'Zoho Books is connected' : 'Ready to connect Zoho Books';
         }
 
+        async function refreshAIStatus() {
+          const response = await fetch('/api/ai/status');
+          const status = await response.json();
+          const target = document.getElementById('ai-status');
+          const pill = document.getElementById('ai-pill');
+          const config = document.getElementById('ai-config');
+          if (status.active_provider === 'openai') {
+            pill.textContent = 'OpenAI';
+            pill.className = 'pill ok';
+            target.textContent = 'ChatGPT/OpenAI processing is active';
+            config.textContent = `Model: ${status.model}`;
+            return;
+          }
+          pill.textContent = 'Local';
+          pill.className = 'pill';
+          target.textContent = 'Using local heuristic processing';
+          config.textContent = 'Set AI_PROVIDER=openai and OPENAI_API_KEY, then restart the server.';
+        }
+
         refreshConnectionStatus();
       </script>
     """
@@ -346,17 +377,6 @@ Thank you.</textarea>
             <div class="status" id="outlook-status">Checking status...</div>
             <div id="outlook-messages"></div>
           </div>
-          <div class="connector">
-            <div class="connector-head">
-              <div>
-                <h2>ChatGPT Processing</h2>
-                <p>Use OpenAI for structured summaries and invoice-field extraction when configured.</p>
-              </div>
-              <span class="pill" id="ai-pill">Checking</span>
-            </div>
-            <div class="status" id="ai-status">Checking status...</div>
-            <div class="notice" id="ai-config"></div>
-          </div>
         </section>
         <section class="records">
           <h2>Recent Results</h2>
@@ -392,25 +412,6 @@ Thank you.</textarea>
           pill.textContent = status.connected ? 'Connected' : 'Not connected';
           pill.className = status.connected ? 'pill ok' : 'pill';
           target.textContent = status.connected ? 'Outlook is connected' : 'Connect Outlook on the Connections page first';
-        }}
-
-        async function aiStatus() {{
-          const response = await fetch('/api/ai/status');
-          const status = await response.json();
-          const target = document.getElementById('ai-status');
-          const pill = document.getElementById('ai-pill');
-          const config = document.getElementById('ai-config');
-          if (status.active_provider === 'openai') {{
-            pill.textContent = 'OpenAI';
-            pill.className = 'pill ok';
-            target.textContent = 'ChatGPT/OpenAI processing is active';
-            config.textContent = `Model: ${{status.model}}`;
-            return;
-          }}
-          pill.textContent = 'Local';
-          pill.className = 'pill';
-          target.textContent = 'Using local heuristic processing';
-          config.textContent = 'Set AI_PROVIDER=openai and OPENAI_API_KEY to enable ChatGPT processing.';
         }}
 
         document.getElementById('outlook-fetch').addEventListener('click', async () => {{
@@ -450,7 +451,6 @@ Thank you.</textarea>
         }}
 
         outlookStatus();
-        aiStatus();
       </script>
     """
     return page_shell("Accountant Supporter Processing", body, active="processing")
