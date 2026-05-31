@@ -35,6 +35,16 @@ class OpenAIConfig:
             model=os.getenv("OPENAI_MODEL", "gpt-5.2").strip() or "gpt-5.2",
         )
 
+    @classmethod
+    def from_settings(cls, settings: dict[str, Any] | None) -> "OpenAIConfig":
+        env_config = cls.from_env()
+        if not settings:
+            return env_config
+        return cls(
+            api_key=str(settings.get("openai_api_key") or env_config.api_key).strip(),
+            model=str(settings.get("openai_model") or env_config.model).strip() or "gpt-5.2",
+        )
+
     @property
     def is_configured(self) -> bool:
         return bool(self.api_key)
@@ -165,25 +175,37 @@ class OpenAIProcessor(AIProcessor):
         }
 
 
-def create_ai_processor() -> AIProcessor:
-    provider = os.getenv("AI_PROVIDER", "local").strip().lower()
+def create_ai_processor(settings: dict[str, Any] | None = None) -> AIProcessor:
+    provider = _provider(settings)
     if provider in {"openai", "chatgpt"}:
-        config = OpenAIConfig.from_env()
+        config = OpenAIConfig.from_settings(settings)
         if config.is_configured:
             return OpenAIProcessor(config)
     return LocalHeuristicProcessor()
 
 
-def ai_status() -> dict[str, Any]:
-    config = OpenAIConfig.from_env()
-    provider = os.getenv("AI_PROVIDER", "local").strip().lower()
+def ai_status(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = OpenAIConfig.from_settings(settings)
+    provider = _provider(settings)
     active_provider = "openai" if provider in {"openai", "chatgpt"} and config.is_configured else "local"
     return {
         "configured": config.is_configured,
         "requested_provider": provider,
         "active_provider": active_provider,
         "model": config.model if config.is_configured else None,
+        "settings": {
+            "provider": provider,
+            "openai_model": config.model,
+            "has_openai_api_key": config.is_configured,
+            "saved_locally": bool(settings),
+        },
     }
+
+
+def _provider(settings: dict[str, Any] | None = None) -> str:
+    if settings and settings.get("provider"):
+        return str(settings["provider"]).strip().lower()
+    return os.getenv("AI_PROVIDER", "local").strip().lower()
 
 
 class LocalHeuristicProcessor(AIProcessor):

@@ -43,7 +43,7 @@ def active_workflow() -> Workflow:
 
 def process_email_sample(email: EmailSampleIn) -> ProcessedEmail:
     workflow = load_workflow(get_workflow_path())
-    ai_processor = create_ai_processor()
+    ai_processor = create_ai_processor(storage.get_connector_settings("ai"))
     ai_result = ai_processor.process(email, workflow)
     zoho_status, zoho_payload = zoho_client.create_draft_from_email(
         email,
@@ -92,6 +92,31 @@ def outlook_status() -> dict[str, Any]:
 def zoho_status() -> dict[str, Any]:
     client = get_zoho_oauth_client()
     return client.configured_status(has_token=storage.get_oauth_token("zoho") is not None)
+
+
+def get_ai_status() -> dict[str, Any]:
+    return ai_status(storage.get_connector_settings("ai"))
+
+
+def save_ai_settings(data: dict[str, Any]) -> dict[str, Any]:
+    existing = storage.get_connector_settings("ai") or {}
+    provider = str(data.get("provider", existing.get("provider", "local"))).strip().lower()
+    model = str(data.get("openai_model", existing.get("openai_model", "gpt-5.2"))).strip()
+    api_key = str(data.get("openai_api_key", "")).strip()
+    clear_api_key = bool(data.get("clear_openai_api_key", False))
+
+    if provider not in {"local", "openai", "chatgpt"}:
+        raise ValueError("provider must be local, openai, or chatgpt")
+    if not model:
+        raise ValueError("openai_model is required")
+
+    settings = {
+        "provider": provider,
+        "openai_model": model,
+        "openai_api_key": "" if clear_api_key else api_key or existing.get("openai_api_key", ""),
+    }
+    storage.save_connector_settings("ai", settings)
+    return get_ai_status()
 
 
 def start_outlook_redirect_auth() -> str:
@@ -262,6 +287,16 @@ def index() -> str:
             <span class="pill" id="ai-pill">Checking</span>
           </div>
           <div class="status" id="ai-status">Checking status...</div>
+          <label for="ai-provider">AI Provider</label>
+          <input id="ai-provider" autocomplete="off" placeholder="local or openai" />
+          <label for="openai-model">OpenAI Model</label>
+          <input id="openai-model" autocomplete="off" placeholder="gpt-5.2" />
+          <label for="openai-api-key">OpenAI API Key</label>
+          <input id="openai-api-key" type="password" autocomplete="off" placeholder="Paste key to save or rotate" />
+          <div class="toolbar">
+            <button type="button" id="ai-save">Save ChatGPT settings</button>
+            <button class="secondary" type="button" id="ai-clear-key">Clear saved key</button>
+          </div>
           <div class="notice" id="ai-config"></div>
         </section>
       </main>
@@ -321,18 +356,60 @@ def index() -> str:
           const target = document.getElementById('ai-status');
           const pill = document.getElementById('ai-pill');
           const config = document.getElementById('ai-config');
+          document.getElementById('ai-provider').value = status.settings?.provider || 'local';
+          document.getElementById('openai-model').value = status.settings?.openai_model || 'gpt-5.2';
+          document.getElementById('openai-api-key').value = '';
           if (status.active_provider === 'openai') {
             pill.textContent = 'OpenAI';
             pill.className = 'pill ok';
             target.textContent = 'ChatGPT/OpenAI processing is active';
-            config.textContent = `Model: ${status.model}`;
+            config.textContent = `Model: ${status.model}. API key is saved locally and hidden.`;
             return;
           }
           pill.textContent = 'Local';
           pill.className = 'pill';
           target.textContent = 'Using local heuristic processing';
-          config.textContent = 'Set AI_PROVIDER=openai and OPENAI_API_KEY, then restart the server.';
+          config.textContent = status.settings?.has_openai_api_key
+            ? 'API key is saved locally. Set provider to openai to activate ChatGPT processing.'
+            : 'Set provider to openai and save an API key to enable ChatGPT processing.';
         }
+
+        document.getElementById('ai-save').addEventListener('click', async () => {
+          const response = await fetch('/api/ai/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              provider: document.getElementById('ai-provider').value,
+              openai_model: document.getElementById('openai-model').value,
+              openai_api_key: document.getElementById('openai-api-key').value,
+              clear_openai_api_key: false
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            document.getElementById('ai-status').textContent = result.error || 'Unable to save AI settings';
+            return;
+          }
+          await refreshAIStatus();
+        });
+
+        document.getElementById('ai-clear-key').addEventListener('click', async () => {
+          const response = await fetch('/api/ai/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              provider: document.getElementById('ai-provider').value,
+              openai_model: document.getElementById('openai-model').value,
+              clear_openai_api_key: true
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            document.getElementById('ai-status').textContent = result.error || 'Unable to clear AI key';
+            return;
+          }
+          await refreshAIStatus();
+        });
 
         refreshConnectionStatus();
       </script>
@@ -505,7 +582,7 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             self._send_json(zoho_status())
             return
         if path == "/api/ai/status":
-            self._send_json(ai_status())
+            self._send_json(get_ai_status())
             return
         if path == "/api/outlook/messages":
             self._send_outlook_messages()
@@ -523,6 +600,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/outlook/auth/poll":
             try:
                 self._send_json(poll_outlook_auth())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/ai/settings":
+            try:
+                self._send_json(save_ai_settings(self._read_json()))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return

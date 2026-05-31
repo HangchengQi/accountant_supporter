@@ -2,7 +2,13 @@ import os
 import unittest
 from unittest.mock import patch
 
-from app.ai import OpenAIConfig, ai_status, create_ai_processor, LocalHeuristicProcessor
+from app.ai import (
+    OpenAIConfig,
+    OpenAIProcessor,
+    ai_status,
+    create_ai_processor,
+    LocalHeuristicProcessor,
+)
 
 
 class AIConfigTest(unittest.TestCase):
@@ -27,6 +33,21 @@ class AIConfigTest(unittest.TestCase):
 
         self.assertIsInstance(processor, LocalHeuristicProcessor)
         self.assertEqual(status["active_provider"], "local")
+
+    def test_saved_settings_enable_openai_processor(self) -> None:
+        settings = {
+            "provider": "openai",
+            "openai_api_key": "saved-key",
+            "openai_model": "saved-model",
+        }
+
+        processor = create_ai_processor(settings)
+        status = ai_status(settings)
+
+        self.assertIsInstance(processor, OpenAIProcessor)
+        self.assertEqual(status["active_provider"], "openai")
+        self.assertEqual(status["model"], "saved-model")
+        self.assertTrue(status["settings"]["has_openai_api_key"])
 
 
 if __name__ == "__main__":
