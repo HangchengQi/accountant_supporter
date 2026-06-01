@@ -124,6 +124,12 @@ $env:OPENAI_MODEL="gpt-5.2"
 
 The Connections page shows whether the active processor is local or OpenAI.
 
+## Internal Workflow Process
+
+AI behavior is controlled by the local workflow package at `workflows/vendor_invoice.v1.json`. The private `ai_process.instructions` value is used as the OpenAI system instructions and is not shown in the app UI or returned by the workflow status endpoint.
+
+To change the AI workflow, ship a patch or remote git update that edits the workflow JSON, then restart the local server. The `WORKFLOW_PATH` environment variable can point an installation to a different versioned workflow file.
+
 ## Next Milestones
 
 1. Create real Zoho Books draft bills/invoices from approved payloads.

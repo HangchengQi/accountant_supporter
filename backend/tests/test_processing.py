@@ -10,9 +10,11 @@ class LocalProcessorTest(unittest.TestCase):
         workflow = Workflow(
             name="vendor_invoice_email",
             version=1,
+            summary_sentences=3,
             require_human_review=True,
             minimum_confidence_for_auto_upload=0.9,
             zoho_mode="dry_run",
+            ai_instructions="Extract bookkeeping fields.",
             raw={},
         )
         email = EmailSampleIn(

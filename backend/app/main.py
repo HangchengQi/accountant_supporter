@@ -561,16 +561,7 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/workflow":
             workflow = active_workflow()
-            self._send_json(
-                {
-                    "workflow": workflow.name,
-                    "version": workflow.version,
-                    "require_human_review": workflow.require_human_review,
-                    "minimum_confidence_for_auto_upload": workflow.minimum_confidence_for_auto_upload,
-                    "zoho_mode": workflow.zoho_mode,
-                    "raw": workflow.raw,
-                }
-            )
+            self._send_json(workflow.public_status())
             return
         if path == "/api/processed-emails":
             self._send_json([record.to_dict() for record in list_processed_emails()])

@@ -60,12 +60,7 @@ class OpenAIProcessor(AIProcessor):
 
         payload = {
             "model": self.config.model,
-            "instructions": (
-                "You summarize bookkeeping-related emails and extract invoice fields. "
-                "Return only values supported by the email. Use null when unknown. "
-                "Mark needs_review true when the email is ambiguous or any important "
-                "accounting field is missing. JSON output must match the schema."
-            ),
+            "instructions": workflow.ai_instructions,
             "input": [
                 {
                     "role": "user",
@@ -235,12 +230,12 @@ class LocalHeuristicProcessor(AIProcessor):
             confidence=confidence,
             needs_review=needs_review,
         )
-        return AIResult(summary=self._summarize(email), extracted=extracted)
+        return AIResult(summary=self._summarize(email, workflow), extracted=extracted)
 
-    def _summarize(self, email: EmailSampleIn) -> str:
+    def _summarize(self, email: EmailSampleIn, workflow: Workflow) -> str:
         cleaned = re.sub(r"\s+", " ", email.body).strip()
         sentences = re.split(r"(?<=[.!?])\s+", cleaned)
-        first_sentences = [s for s in sentences if s][:3]
+        first_sentences = [s for s in sentences if s][: workflow.summary_sentences]
         if first_sentences:
             return " ".join(first_sentences)
         return cleaned[:280]

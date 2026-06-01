@@ -9,6 +9,24 @@ from app.ai import (
     create_ai_processor,
     LocalHeuristicProcessor,
 )
+from app.schemas import EmailSampleIn
+from app.workflow import Workflow
+
+
+class CapturingOpenAIProcessor(OpenAIProcessor):
+    def __init__(self, config: OpenAIConfig) -> None:
+        super().__init__(config)
+        self.payload = {}
+
+    def _post_response(self, payload: dict) -> dict:
+        self.payload = payload
+        return {
+            "output_text": (
+                '{"summary":"Captured","category":"invoice","vendor_name":null,'
+                '"invoice_number":null,"invoice_date":null,"due_date":null,'
+                '"amount":null,"currency":null,"confidence":0.75,"needs_review":true}'
+            )
+        }
 
 
 class AIConfigTest(unittest.TestCase):
@@ -48,6 +66,24 @@ class AIConfigTest(unittest.TestCase):
         self.assertEqual(status["active_provider"], "openai")
         self.assertEqual(status["model"], "saved-model")
         self.assertTrue(status["settings"]["has_openai_api_key"])
+
+    def test_openai_processor_uses_workflow_ai_instructions(self) -> None:
+        workflow = Workflow(
+            name="vendor_invoice_email",
+            version=1,
+            summary_sentences=3,
+            require_human_review=True,
+            minimum_confidence_for_auto_upload=0.9,
+            zoho_mode="dry_run",
+            ai_instructions="Follow the private workflow process.",
+            raw={},
+        )
+        email = EmailSampleIn(subject="Invoice", sender="Vendor <ap@example.com>", body="Amount due $10.00")
+        processor = CapturingOpenAIProcessor(OpenAIConfig(api_key="key", model="model"))
+
+        processor.process(email, workflow)
+
+        self.assertEqual(processor.payload["instructions"], "Follow the private workflow process.")
 
 
 if __name__ == "__main__":

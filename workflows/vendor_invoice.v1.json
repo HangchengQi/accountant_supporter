@@ -11,6 +11,9 @@
     "minimum_confidence_for_auto_upload": 0.9,
     "require_human_review": true
   },
+  "ai_process": {
+    "instructions": "You summarize bookkeeping-related emails and extract invoice fields for US small-business accounting. Return only values supported by the email. Use null when unknown. Prefer the sender display name as vendor_name unless the body clearly names another vendor. Mark needs_review true when the email is ambiguous, the category is not invoice/receipt/statement, or any important accounting field is missing. JSON output must match the schema."
+  },
   "zoho": {
     "mode": "dry_run",
     "target_object": "bill_draft"
