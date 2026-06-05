@@ -103,6 +103,12 @@ def save_ai_settings(data: dict[str, Any]) -> dict[str, Any]:
     existing = storage.get_connector_settings("ai") or {}
     provider = str(data.get("provider", existing.get("provider", "local"))).strip().lower()
     model = str(data.get("openai_model", existing.get("openai_model", "gpt-5.2"))).strip()
+    classification_model = str(
+        data.get(
+            "openai_classification_model",
+            existing.get("openai_classification_model", model),
+        )
+    ).strip()
     api_key = str(data.get("openai_api_key", "")).strip()
     clear_api_key = bool(data.get("clear_openai_api_key", False))
 
@@ -110,10 +116,13 @@ def save_ai_settings(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("provider must be local, openai, or chatgpt")
     if not model:
         raise ValueError("openai_model is required")
+    if not classification_model:
+        raise ValueError("openai_classification_model is required")
 
     settings = {
         "provider": provider,
         "openai_model": model,
+        "openai_classification_model": classification_model,
         "openai_api_key": "" if clear_api_key else api_key or existing.get("openai_api_key", ""),
     }
     storage.save_connector_settings("ai", settings)
@@ -240,7 +249,12 @@ def ingest_outlook_messages(top: int = 10) -> dict[str, Any]:
 
 
 def run_jobs(max_jobs: int = 10) -> dict[str, Any]:
-    return run_queue_once(storage, process_email_sample, max_jobs=max_jobs).to_dict()
+    return run_queue_once(
+        storage,
+        process_email_sample,
+        max_jobs=max_jobs,
+        ai_settings=storage.get_connector_settings("ai"),
+    ).to_dict()
 
 
 def page_shell(title: str, body: str, active: str = "") -> str:
@@ -319,6 +333,8 @@ def index() -> str:
           <input id="ai-provider" autocomplete="off" placeholder="local or openai" />
           <label for="openai-model">OpenAI Model</label>
           <input id="openai-model" autocomplete="off" placeholder="gpt-5.2" />
+          <label for="openai-classification-model">Classification Model</label>
+          <input id="openai-classification-model" autocomplete="off" placeholder="Use a cheaper model for classify_email" />
           <label for="openai-api-key">OpenAI API Key</label>
           <input id="openai-api-key" type="password" autocomplete="off" placeholder="Paste key to save or rotate" />
           <div class="toolbar">
@@ -386,12 +402,15 @@ def index() -> str:
           const config = document.getElementById('ai-config');
           document.getElementById('ai-provider').value = status.settings?.provider || 'local';
           document.getElementById('openai-model').value = status.settings?.openai_model || 'gpt-5.2';
+          document.getElementById('openai-classification-model').value =
+            status.settings?.openai_classification_model || status.settings?.openai_model || 'gpt-5.2';
           document.getElementById('openai-api-key').value = '';
           if (status.active_provider === 'openai') {
             pill.textContent = 'OpenAI';
             pill.className = 'pill ok';
             target.textContent = 'ChatGPT/OpenAI processing is active';
-            config.textContent = `Model: ${status.model}. API key is saved locally and hidden.`;
+            config.textContent =
+              `Models: classify_email=${status.job_models?.classify_email || 'rules'}, process_email=${status.job_models?.process_email || status.model}. API key is saved locally and hidden.`;
             return;
           }
           pill.textContent = 'Local';
@@ -409,6 +428,7 @@ def index() -> str:
             body: JSON.stringify({
               provider: document.getElementById('ai-provider').value,
               openai_model: document.getElementById('openai-model').value,
+              openai_classification_model: document.getElementById('openai-classification-model').value,
               openai_api_key: document.getElementById('openai-api-key').value,
               clear_openai_api_key: false
             })
@@ -428,6 +448,7 @@ def index() -> str:
             body: JSON.stringify({
               provider: document.getElementById('ai-provider').value,
               openai_model: document.getElementById('openai-model').value,
+              openai_classification_model: document.getElementById('openai-classification-model').value,
               clear_openai_api_key: true
             })
           });

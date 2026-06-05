@@ -41,7 +41,12 @@ def enqueue_mail_message(storage: SQLiteStorage, message: MailMessage) -> Job:
     )
 
 
-def run_queue_once(storage: SQLiteStorage, process_email: Any, max_jobs: int = 10) -> QueueRunResult:
+def run_queue_once(
+    storage: SQLiteStorage,
+    process_email: Any,
+    max_jobs: int = 10,
+    ai_settings: dict[str, Any] | None = None,
+) -> QueueRunResult:
     claimed = 0
     completed = 0
     failed = 0
@@ -55,7 +60,7 @@ def run_queue_once(storage: SQLiteStorage, process_email: Any, max_jobs: int = 1
             break
         claimed += 1
         try:
-            outcome = _run_job(storage, job, process_email)
+            outcome = _run_job(storage, job, process_email, ai_settings)
             completed += 1
             created_processing_jobs += int(outcome.get("created_processing_job", False))
             skipped_irrelevant += int(outcome.get("skipped_irrelevant", False))
@@ -85,17 +90,26 @@ def queue_status(storage: SQLiteStorage) -> dict[str, Any]:
     }
 
 
-def _run_job(storage: SQLiteStorage, job: Job, process_email: Any) -> dict[str, Any]:
+def _run_job(
+    storage: SQLiteStorage,
+    job: Job,
+    process_email: Any,
+    ai_settings: dict[str, Any] | None,
+) -> dict[str, Any]:
     if job.job_type == CLASSIFY_EMAIL:
-        return _classify_message(storage, job)
+        return _classify_message(storage, job, ai_settings)
     if job.job_type == PROCESS_EMAIL:
         return _process_message(storage, job, process_email)
     raise ValueError(f"unknown job type: {job.job_type}")
 
 
-def _classify_message(storage: SQLiteStorage, job: Job) -> dict[str, Any]:
+def _classify_message(
+    storage: SQLiteStorage,
+    job: Job,
+    ai_settings: dict[str, Any] | None,
+) -> dict[str, Any]:
     message = _job_message(storage, job)
-    classification = classify_email(message.to_email())
+    classification = classify_email(message.to_email(), ai_settings)
     status = "relevant" if classification.is_bill_relevant else "skipped"
     if classification.needs_review and not classification.is_bill_relevant:
         status = "needs_review"
@@ -118,6 +132,7 @@ def _classify_message(storage: SQLiteStorage, job: Job) -> dict[str, Any]:
             "status": "classified",
             "category": classification.category,
             "confidence": classification.confidence,
+            "mode": classification.mode,
             "created_processing_job": processing_job.status == "pending",
             "processing_job_id": processing_job.id,
         }
@@ -126,6 +141,7 @@ def _classify_message(storage: SQLiteStorage, job: Job) -> dict[str, Any]:
         "status": status,
         "category": classification.category,
         "confidence": classification.confidence,
+        "mode": classification.mode,
         "skipped_irrelevant": status == "skipped",
     }
 

@@ -23,6 +23,7 @@ class ClassificationResult:
     category: str
     confidence: float
     needs_review: bool
+    mode: str = "rules"
 
     @property
     def is_bill_relevant(self) -> bool:
@@ -47,13 +48,19 @@ class OpenAIConfig:
         )
 
     @classmethod
-    def from_settings(cls, settings: dict[str, Any] | None) -> "OpenAIConfig":
+    def from_settings(
+        cls,
+        settings: dict[str, Any] | None,
+        model_key: str = "openai_model",
+        env_model_key: str = "OPENAI_MODEL",
+    ) -> "OpenAIConfig":
         env_config = cls.from_env()
+        env_model = os.getenv(env_model_key, "").strip()
         if not settings:
-            return env_config
+            return cls(api_key=env_config.api_key, model=env_model or env_config.model)
         return cls(
             api_key=str(settings.get("openai_api_key") or env_config.api_key).strip(),
-            model=str(settings.get("openai_model") or env_config.model).strip() or "gpt-5.2",
+            model=str(settings.get(model_key) or env_model or env_config.model).strip() or "gpt-5.2",
         )
 
     @property
@@ -181,6 +188,100 @@ class OpenAIProcessor(AIProcessor):
         }
 
 
+class OpenAIClassifier:
+    def __init__(self, config: OpenAIConfig | None = None) -> None:
+        self.config = config or OpenAIConfig.from_env()
+
+    def classify(self, email: EmailSampleIn) -> ClassificationResult:
+        if not self.config.is_configured:
+            raise ValueError("OPENAI_API_KEY is required")
+
+        payload = {
+            "model": self.config.model,
+            "instructions": (
+                "Classify bookkeeping email relevance. Use the cheapest reliable reasoning. "
+                "Return invoice, receipt, statement, bookkeeping_question, or irrelevant. "
+                "Mark needs_review true only when the email may need human triage."
+            ),
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Subject: {email.subject}\n"
+                        f"Sender: {email.sender}\n\n"
+                        f"Email body:\n{email.body}"
+                    ),
+                }
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "email_classification",
+                    "strict": True,
+                    "schema": self._schema(),
+                }
+            },
+        }
+
+        response = self._post_response(payload)
+        result = self._extract_json(response)
+        return ClassificationResult(
+            category=str(result["category"]),
+            confidence=float(result["confidence"]),
+            needs_review=bool(result["needs_review"]),
+            mode=f"openai:{self.config.model}",
+        )
+
+    def _post_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=45) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8")
+            raise ValueError(f"OpenAI classification failed: {body or exc}") from exc
+
+    def _extract_json(self, response: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(response.get("output_text"), str):
+            return json.loads(response["output_text"])
+
+        for item in response.get("output", []):
+            for content in item.get("content", []):
+                text = content.get("text")
+                if text:
+                    return json.loads(text)
+        raise ValueError("OpenAI classification response did not include JSON text")
+
+    def _schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["category", "confidence", "needs_review"],
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "invoice",
+                        "receipt",
+                        "statement",
+                        "bookkeeping_question",
+                        "irrelevant",
+                    ],
+                },
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "needs_review": {"type": "boolean"},
+            },
+        }
+
+
 def create_ai_processor(settings: dict[str, Any] | None = None) -> AIProcessor:
     provider = _provider(settings)
     if provider in {"openai", "chatgpt"}:
@@ -192,6 +293,11 @@ def create_ai_processor(settings: dict[str, Any] | None = None) -> AIProcessor:
 
 def ai_status(settings: dict[str, Any] | None = None) -> dict[str, Any]:
     config = OpenAIConfig.from_settings(settings)
+    classification_config = OpenAIConfig.from_settings(
+        settings,
+        model_key="openai_classification_model",
+        env_model_key="OPENAI_CLASSIFICATION_MODEL",
+    )
     provider = _provider(settings)
     active_provider = "openai" if provider in {"openai", "chatgpt"} and config.is_configured else "local"
     return {
@@ -199,9 +305,14 @@ def ai_status(settings: dict[str, Any] | None = None) -> dict[str, Any]:
         "requested_provider": provider,
         "active_provider": active_provider,
         "model": config.model if config.is_configured else None,
+        "job_models": {
+            "classify_email": classification_config.model if classification_config.is_configured else "rules",
+            "process_email": config.model if config.is_configured else "local",
+        },
         "settings": {
             "provider": provider,
             "openai_model": config.model,
+            "openai_classification_model": classification_config.model,
             "has_openai_api_key": config.is_configured,
             "saved_locally": bool(settings),
         },
@@ -214,7 +325,22 @@ def _provider(settings: dict[str, Any] | None = None) -> str:
     return os.getenv("AI_PROVIDER", "local").strip().lower()
 
 
-def classify_email(email: EmailSampleIn) -> ClassificationResult:
+def classify_email(email: EmailSampleIn, settings: dict[str, Any] | None = None) -> ClassificationResult:
+    rule_result = classify_email_with_rules(email)
+    if rule_result.confidence >= 0.85 or _provider(settings) not in {"openai", "chatgpt"}:
+        return rule_result
+
+    config = OpenAIConfig.from_settings(
+        settings,
+        model_key="openai_classification_model",
+        env_model_key="OPENAI_CLASSIFICATION_MODEL",
+    )
+    if not config.is_configured:
+        return rule_result
+    return OpenAIClassifier(config).classify(email)
+
+
+def classify_email_with_rules(email: EmailSampleIn) -> ClassificationResult:
     text = f"{email.subject}\n{email.body}".lower()
     if any(word in text for word in ["invoice", "amount due", "bill #", "bill number"]):
         return ClassificationResult("invoice", 0.86, False)

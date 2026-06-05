@@ -3,9 +3,12 @@ import unittest
 from unittest.mock import patch
 
 from app.ai import (
+    ClassificationResult,
+    OpenAIClassifier,
     OpenAIConfig,
     OpenAIProcessor,
     ai_status,
+    classify_email,
     create_ai_processor,
     LocalHeuristicProcessor,
 )
@@ -25,6 +28,20 @@ class CapturingOpenAIProcessor(OpenAIProcessor):
                 '{"summary":"Captured","category":"invoice","vendor_name":null,'
                 '"invoice_number":null,"invoice_date":null,"due_date":null,'
                 '"amount":null,"currency":null,"confidence":0.75,"needs_review":true}'
+            )
+        }
+
+
+class CapturingOpenAIClassifier(OpenAIClassifier):
+    def __init__(self, config: OpenAIConfig) -> None:
+        super().__init__(config)
+        self.payload = {}
+
+    def _post_response(self, payload: dict) -> dict:
+        self.payload = payload
+        return {
+            "output_text": (
+                '{"category":"bookkeeping_question","confidence":0.7,"needs_review":true}'
             )
         }
 
@@ -67,6 +84,19 @@ class AIConfigTest(unittest.TestCase):
         self.assertEqual(status["model"], "saved-model")
         self.assertTrue(status["settings"]["has_openai_api_key"])
 
+    def test_status_reports_per_job_models(self) -> None:
+        status = ai_status(
+            {
+                "provider": "openai",
+                "openai_api_key": "saved-key",
+                "openai_model": "strong-model",
+                "openai_classification_model": "simple-model",
+            }
+        )
+
+        self.assertEqual(status["job_models"]["classify_email"], "simple-model")
+        self.assertEqual(status["job_models"]["process_email"], "strong-model")
+
     def test_openai_processor_uses_workflow_ai_instructions(self) -> None:
         workflow = Workflow(
             name="vendor_invoice_email",
@@ -84,6 +114,38 @@ class AIConfigTest(unittest.TestCase):
         processor.process(email, workflow)
 
         self.assertEqual(processor.payload["instructions"], "Follow the private workflow process.")
+
+    def test_openai_classifier_uses_classification_model(self) -> None:
+        email = EmailSampleIn(subject="Question", sender="Vendor <ap@example.com>", body="Is this tax related?")
+        classifier = CapturingOpenAIClassifier(OpenAIConfig(api_key="key", model="simple-model"))
+
+        result = classifier.classify(email)
+
+        self.assertEqual(classifier.payload["model"], "simple-model")
+        self.assertEqual(result.category, "bookkeeping_question")
+        self.assertEqual(result.mode, "openai:simple-model")
+
+    def test_uncertain_classification_uses_openai_when_configured(self) -> None:
+        email = EmailSampleIn(subject="Question", sender="Vendor <ap@example.com>", body="Can you check this tax form?")
+        settings = {
+            "provider": "openai",
+            "openai_api_key": "saved-key",
+            "openai_model": "strong-model",
+            "openai_classification_model": "simple-model",
+        }
+
+        with patch("app.ai.OpenAIClassifier") as classifier_class:
+            classifier_class.return_value.classify.return_value = ClassificationResult(
+                "bookkeeping_question",
+                0.7,
+                True,
+                "openai:simple-model",
+            )
+            result = classify_email(email, settings)
+
+        self.assertEqual(result.mode, "openai:simple-model")
+        classifier_class.assert_called_once()
+        self.assertEqual(classifier_class.call_args.args[0].model, "simple-model")
 
 
 if __name__ == "__main__":
