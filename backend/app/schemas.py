@@ -29,6 +29,53 @@ class EmailSampleIn:
 
 
 @dataclass(frozen=True)
+class MailMessage:
+    id: int
+    provider: str
+    provider_message_id: str
+    received_at: str | None
+    subject: str
+    sender: str
+    body_preview: str
+    body: str
+    classification_status: str
+    classification_category: str | None
+    classification_confidence: float | None
+    created_at: datetime
+    updated_at: datetime
+
+    def to_email(self) -> EmailSampleIn:
+        return EmailSampleIn(subject=self.subject, sender=self.sender, body=self.body or self.body_preview)
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["created_at"] = self.created_at.isoformat()
+        result["updated_at"] = self.updated_at.isoformat()
+        return result
+
+
+@dataclass(frozen=True)
+class Job:
+    id: int
+    job_type: str
+    status: str
+    priority: int
+    attempts: int
+    max_attempts: int
+    mail_message_id: int | None
+    payload: dict[str, Any]
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["created_at"] = self.created_at.isoformat()
+        result["updated_at"] = self.updated_at.isoformat()
+        return result
+
+
+@dataclass(frozen=True)
 class ExtractedFields:
     category: str
     confidence: float

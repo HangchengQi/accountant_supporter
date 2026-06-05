@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .ai import ai_status, create_ai_processor
+from .jobs import enqueue_mail_message, queue_status, run_queue_once
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
 from .schemas import EmailSampleIn, ProcessedEmail
 from .storage import SQLiteStorage
@@ -213,6 +214,33 @@ def list_outlook_messages(top: int = 10) -> list[dict[str, Any]]:
         message.to_dict()
         for message in get_outlook_client().list_inbox_messages(token=token, top=top)
     ]
+
+
+def ingest_outlook_messages(top: int = 10) -> dict[str, Any]:
+    token = get_outlook_token()
+    messages = get_outlook_client().list_inbox_messages(token=token, top=top)
+    ingested: list[dict[str, Any]] = []
+    for message in messages:
+        stored = storage.save_mail_message(
+            provider="outlook",
+            provider_message_id=message.id,
+            received_at=message.received_at,
+            subject=message.subject,
+            sender=message.sender,
+            body_preview=message.body_preview,
+            body=message.body,
+        )
+        job = enqueue_mail_message(storage, stored)
+        item = message.to_dict()
+        item["mail_message_id"] = stored.id
+        item["classification_status"] = stored.classification_status
+        item["classification_job_id"] = job.id
+        ingested.append(item)
+    return {"messages": ingested, "ingested": len(ingested)}
+
+
+def run_jobs(max_jobs: int = 10) -> dict[str, Any]:
+    return run_queue_once(storage, process_email_sample, max_jobs=max_jobs).to_dict()
 
 
 def page_shell(title: str, body: str, active: str = "") -> str:
@@ -444,14 +472,16 @@ Thank you.</textarea>
             <div class="connector-head">
               <div>
                 <h2>Mail Messages</h2>
-                <p>Fetch connected Outlook messages and send selected emails into the summary workflow.</p>
+                <p>Fetch connected Outlook messages into the local queue for classification and processing.</p>
               </div>
               <span class="pill" id="outlook-pill">Checking</span>
             </div>
             <div class="toolbar">
-              <button class="secondary" type="button" id="outlook-fetch">Fetch inbox</button>
+              <button class="secondary" type="button" id="outlook-fetch">Fetch inbox into queue</button>
+              <button class="secondary" type="button" id="queue-run">Run queue</button>
             </div>
             <div class="status" id="outlook-status">Checking status...</div>
+            <div class="notice" id="queue-status">Queue status will appear here.</div>
             <div id="outlook-messages"></div>
           </div>
         </section>
@@ -499,35 +529,48 @@ Thank you.</textarea>
             return;
           }}
           outlookMessages = result.messages || [];
+          await refreshQueueStatus();
           document.getElementById('outlook-messages').innerHTML = outlookMessages.map((message, index) => `
             <article>
               <strong>${{escapeHtml(message.subject)}}</strong>
               <div class="meta">${{escapeHtml(message.sender)}} | ${{escapeHtml(message.received_at || '')}}</div>
               <p>${{escapeHtml(message.body_preview)}}</p>
-              <button class="secondary" type="button" onclick="processOutlookMessage(${{index}})">Process</button>
+              <span class="pill">Queued</span>
             </article>
           `).join('') || '<p>No messages found.</p>';
         }});
 
-        async function processOutlookMessage(index) {{
-          const message = outlookMessages[index];
-          const response = await fetch('/api/email-samples/process', {{
+        document.getElementById('queue-run').addEventListener('click', async () => {{
+          const response = await fetch('/api/jobs/run', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{
-              subject: message.subject,
-              sender: message.sender,
-              body: message.body || message.body_preview
-            }})
+            body: JSON.stringify({{ max_jobs: 10 }})
           }});
+          const result = await response.json();
           if (!response.ok) {{
-            alert('Processing failed');
+            document.getElementById('queue-status').textContent = result.error || 'Unable to run queue';
             return;
           }}
-          window.location.reload();
+          document.getElementById('queue-status').textContent =
+            `Queue run: claimed ${{result.claimed}}, completed ${{result.completed}}, created processing jobs ${{result.created_processing_jobs}}, skipped ${{result.skipped_irrelevant}}.`;
+          if (result.completed > 0) {{
+            window.location.reload();
+          }}
+        }});
+
+        async function refreshQueueStatus() {{
+          const response = await fetch('/api/jobs/status');
+          const status = await response.json();
+          if (!response.ok) {{
+            return;
+          }}
+          const counts = status.job_counts || {{}};
+          document.getElementById('queue-status').textContent =
+            `Jobs: pending ${{counts.pending || 0}}, running ${{counts.running || 0}}, completed ${{counts.completed || 0}}, failed ${{counts.failed || 0}}.`;
         }}
 
         outlookStatus();
+        refreshQueueStatus();
       </script>
     """
     return page_shell("Accountant Supporter Processing", body, active="processing")
@@ -578,6 +621,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/outlook/messages":
             self._send_outlook_messages()
             return
+        if path == "/api/jobs/status":
+            self._send_json(queue_status(storage))
+            return
         self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -597,6 +643,14 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/ai/settings":
             try:
                 self._send_json(save_ai_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/jobs/run":
+            try:
+                payload = self._read_json()
+                max_jobs = int(payload.get("max_jobs", 10))
+                self._send_json(run_jobs(max_jobs=max_jobs))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -641,7 +695,7 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             except ValueError:
                 top = 10
         try:
-            self._send_json({"messages": list_outlook_messages(top=top)})
+            self._send_json(ingest_outlook_messages(top=top))
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 

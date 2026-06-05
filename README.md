@@ -130,6 +130,15 @@ AI behavior is controlled by the local workflow package at `workflows/vendor_inv
 
 To change the AI workflow, ship a patch or remote git update that edits the workflow JSON, then restart the local server. The `WORKFLOW_PATH` environment variable can point an installation to a different versioned workflow file.
 
+## Local Job Queue
+
+Mail ingestion now stores raw messages in SQLite before processing. Outlook fetches are deduplicated by provider message ID, then each new message gets a `classify_email` job. Bill-relevant messages (`invoice`, `receipt`, and `statement`) are promoted to `process_email` jobs; irrelevant messages are marked skipped.
+
+The Processing page can fetch Outlook messages into the queue and run a local queue pass. Internal API endpoints are also available for an MCP poller or scheduler:
+
+- `GET /api/jobs/status`
+- `POST /api/jobs/run` with `{"max_jobs": 10}`
+
 ## Next Milestones
 
 1. Create real Zoho Books draft bills/invoices from approved payloads.

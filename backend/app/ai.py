@@ -18,6 +18,17 @@ class AIResult:
     extracted: ExtractedFields
 
 
+@dataclass(frozen=True)
+class ClassificationResult:
+    category: str
+    confidence: float
+    needs_review: bool
+
+    @property
+    def is_bill_relevant(self) -> bool:
+        return self.category in {"invoice", "receipt", "statement"}
+
+
 class AIProcessor:
     def process(self, email: EmailSampleIn, workflow: Workflow) -> AIResult:
         raise NotImplementedError
@@ -201,6 +212,19 @@ def _provider(settings: dict[str, Any] | None = None) -> str:
     if settings and settings.get("provider"):
         return str(settings["provider"]).strip().lower()
     return os.getenv("AI_PROVIDER", "local").strip().lower()
+
+
+def classify_email(email: EmailSampleIn) -> ClassificationResult:
+    text = f"{email.subject}\n{email.body}".lower()
+    if any(word in text for word in ["invoice", "amount due", "bill #", "bill number"]):
+        return ClassificationResult("invoice", 0.86, False)
+    if any(word in text for word in ["receipt", "paid", "payment received"]):
+        return ClassificationResult("receipt", 0.82, False)
+    if "statement" in text:
+        return ClassificationResult("statement", 0.8, False)
+    if any(word in text for word in ["bookkeeping", "accounting", "1099", "w-9", "tax"]):
+        return ClassificationResult("bookkeeping_question", 0.62, True)
+    return ClassificationResult("irrelevant", 0.72, False)
 
 
 class LocalHeuristicProcessor(AIProcessor):
