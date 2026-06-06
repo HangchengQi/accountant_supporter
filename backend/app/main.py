@@ -19,6 +19,7 @@ from .ai import (
 from .billing import BillAttachment, save_billing_artifacts
 from .jobs import enqueue_mail_message, queue_status, run_queue_once
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
+from .pdf_context import append_attachment_context, build_attachment_context
 from .schemas import EmailSampleIn, MailMessage, ProcessedEmail
 from .storage import SQLiteStorage
 from .workflow import Workflow, load_workflow
@@ -76,19 +77,44 @@ def process_email_sample(email: EmailSampleIn) -> ProcessedEmail:
 
 
 def process_mail_message(message: MailMessage) -> ProcessedEmail:
-    record = process_email_sample(message.to_email())
+    attachments = []
+    email = message.to_email()
     if message.provider == "outlook":
-        _handle_outlook_billing_artifacts(message, record)
+        attachments = _list_outlook_bill_attachments(message)
+        email = _email_with_attachment_context(email, attachments)
+    record = process_email_sample(email)
+    if message.provider == "outlook":
+        _handle_outlook_billing_artifacts(message, record, attachments)
     return record
 
 
-def _handle_outlook_billing_artifacts(message: MailMessage, record: ProcessedEmail) -> None:
+def _list_outlook_bill_attachments(message: MailMessage) -> list[BillAttachment]:
     token = get_outlook_token()
     client = get_outlook_client()
-    attachments = [
+    return [
         BillAttachment(name=attachment.name, content=attachment.content)
         for attachment in client.list_file_attachments(token, message.provider_message_id)
     ]
+
+
+def _email_with_attachment_context(
+    email: EmailSampleIn,
+    attachments: list[BillAttachment],
+) -> EmailSampleIn:
+    return EmailSampleIn(
+        subject=email.subject,
+        sender=email.sender,
+        body=append_attachment_context(email.body, build_attachment_context(attachments)),
+    )
+
+
+def _handle_outlook_billing_artifacts(
+    message: MailMessage,
+    record: ProcessedEmail,
+    attachments: list[BillAttachment],
+) -> None:
+    token = get_outlook_token()
+    client = get_outlook_client()
     artifacts = save_billing_artifacts(
         message=message,
         processed=record,
