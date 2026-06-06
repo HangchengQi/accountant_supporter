@@ -18,6 +18,21 @@ class ZohoOAuthTest(unittest.TestCase):
 
         self.assertFalse(status["configured"])
         self.assertFalse(status["connected"])
+        self.assertFalse(status["settings"]["has_client_secret"])
+
+    def test_config_from_settings_overrides_env(self) -> None:
+        config = ZohoConfig.from_settings(
+            {
+                "client_id": "saved-client",
+                "client_secret": "saved-secret",
+                "redirect_uri": "http://127.0.0.1:8080/auth/zoho/callback",
+                "scopes": "ZohoBooks.bills.CREATE",
+            }
+        )
+
+        self.assertEqual(config.client_id, "saved-client")
+        self.assertEqual(config.client_secret, "saved-secret")
+        self.assertEqual(config.scopes, "ZohoBooks.bills.CREATE")
 
     def test_authorization_url_points_to_zoho_accounts(self) -> None:
         client = ZohoOAuthClient(

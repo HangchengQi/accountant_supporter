@@ -148,7 +148,7 @@ def get_outlook_client() -> OutlookGraphClient:
 
 
 def get_zoho_oauth_client() -> ZohoOAuthClient:
-    return ZohoOAuthClient(ZohoConfig.from_env())
+    return ZohoOAuthClient(ZohoConfig.from_settings(storage.get_connector_settings("zoho")))
 
 
 def outlook_status() -> dict[str, Any]:
@@ -224,7 +224,45 @@ def _outlook_account_type(tenant_id: str) -> str:
 
 def zoho_status() -> dict[str, Any]:
     client = get_zoho_oauth_client()
-    return client.configured_status(has_token=storage.get_oauth_token("zoho") is not None)
+    status = client.configured_status(has_token=storage.get_oauth_token("zoho") is not None)
+    status["settings"]["saved_locally"] = bool(storage.get_connector_settings("zoho"))
+    return status
+
+
+def save_zoho_settings(data: dict[str, Any]) -> dict[str, Any]:
+    existing = storage.get_connector_settings("zoho") or {}
+    env_config = ZohoConfig.from_env()
+    client_id = str(data.get("client_id", existing.get("client_id", env_config.client_id))).strip()
+    client_secret = str(data.get("client_secret", "")).strip() or str(
+        existing.get("client_secret", env_config.client_secret)
+    ).strip()
+    redirect_uri = str(
+        data.get(
+            "redirect_uri",
+            existing.get("redirect_uri", env_config.redirect_uri),
+        )
+    ).strip()
+    scopes = str(
+        data.get("scopes", existing.get("scopes", env_config.scopes))
+    ).strip() or "ZohoBooks.fullaccess.all"
+
+    if not client_id:
+        raise ValueError("client_id is required")
+    if not client_secret:
+        raise ValueError("client_secret is required")
+    if not redirect_uri:
+        raise ValueError("redirect_uri is required")
+
+    storage.save_connector_settings(
+        "zoho",
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+            "scopes": scopes,
+        },
+    )
+    return zoho_status()
 
 
 def get_ai_status() -> dict[str, Any]:
@@ -483,6 +521,18 @@ def index() -> str:
           </div>
           <div class="status" id="zoho-status">Checking status...</div>
           <div class="notice" id="zoho-config"></div>
+          <label for="zoho-client-id">Zoho Client ID</label>
+          <input id="zoho-client-id" autocomplete="off" placeholder="Zoho API Console client ID" />
+          <label for="zoho-client-secret">Zoho Client Secret</label>
+          <input id="zoho-client-secret" type="password" autocomplete="off" placeholder="Paste secret to save or rotate" />
+          <label for="zoho-redirect-uri">Zoho Redirect URI</label>
+          <input id="zoho-redirect-uri" autocomplete="off" placeholder="http://127.0.0.1:8080/auth/zoho/callback" />
+          <label for="zoho-scopes">Zoho Scopes</label>
+          <input id="zoho-scopes" autocomplete="off" placeholder="ZohoBooks.fullaccess.all" />
+          <div class="toolbar">
+            <button class="secondary" type="button" id="zoho-save">Save Zoho settings</button>
+          </div>
+          <div class="status" id="zoho-save-status"></div>
         </section>
 
         <section class="connection-card">
@@ -639,9 +689,14 @@ def index() -> str:
           const pill = document.getElementById('zoho-pill');
           const config = document.getElementById('zoho-config');
           const connect = document.getElementById('zoho-connect');
+          document.getElementById('zoho-client-id').value = status.settings?.client_id || '';
+          document.getElementById('zoho-client-secret').value = '';
+          document.getElementById('zoho-redirect-uri').value =
+            status.settings?.redirect_uri || 'http://127.0.0.1:8080/auth/zoho/callback';
+          document.getElementById('zoho-scopes').value = status.settings?.scopes || 'ZohoBooks.fullaccess.all';
           if (!status.configured) {
             target.textContent = 'Zoho Books authentication is not configured by the app admin yet.';
-            config.textContent = 'Set ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, and ZOHO_REDIRECT_URI, then restart the server.';
+            config.textContent = 'Enter the Zoho Client ID, Client Secret, and Redirect URI, then save.';
             pill.textContent = 'Not configured';
             pill.className = 'pill';
             connect.removeAttribute('href');
@@ -652,11 +707,33 @@ def index() -> str:
           connect.setAttribute('href', '/auth/zoho/start');
           connect.removeAttribute('aria-disabled');
           connect.className = 'button-link';
-          config.textContent = `US Zoho login: ${status.login_url} | Redirect URI: ${status.redirect_uri}`;
+          config.textContent =
+            `US Zoho login: ${status.login_url} | Redirect URI: ${status.redirect_uri}. ` +
+            `Client secret is ${status.settings?.has_client_secret ? 'saved locally and hidden' : 'not saved'}.`;
           pill.textContent = status.connected ? 'Connected' : 'Configured';
           pill.className = status.connected ? 'pill ok' : 'pill';
           target.textContent = status.connected ? 'Zoho Books is connected' : 'Ready to connect Zoho Books';
         }
+
+        document.getElementById('zoho-save').addEventListener('click', async () => {
+          const response = await fetch('/api/zoho/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              client_id: document.getElementById('zoho-client-id').value,
+              client_secret: document.getElementById('zoho-client-secret').value,
+              redirect_uri: document.getElementById('zoho-redirect-uri').value,
+              scopes: document.getElementById('zoho-scopes').value
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            document.getElementById('zoho-save-status').textContent = result.error || 'Unable to save Zoho settings';
+            return;
+          }
+          document.getElementById('zoho-save-status').textContent = 'Zoho settings saved locally.';
+          await refreshZohoStatus();
+        });
 
         async function refreshAIStatus() {
           const response = await fetch('/api/ai/status');
@@ -959,6 +1036,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/outlook/settings":
             try:
                 self._send_json(save_outlook_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/zoho/settings":
+            try:
+                self._send_json(save_zoho_settings(self._read_json()))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return

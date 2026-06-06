@@ -35,6 +35,18 @@ class ZohoConfig:
             scopes=os.getenv("ZOHO_SCOPES", "ZohoBooks.fullaccess.all").strip(),
         )
 
+    @classmethod
+    def from_settings(cls, settings: dict[str, Any] | None) -> "ZohoConfig":
+        env_config = cls.from_env()
+        if not settings:
+            return env_config
+        return cls(
+            client_id=str(settings.get("client_id") or env_config.client_id).strip(),
+            client_secret=str(settings.get("client_secret") or env_config.client_secret).strip(),
+            redirect_uri=str(settings.get("redirect_uri") or env_config.redirect_uri).strip(),
+            scopes=str(settings.get("scopes") or env_config.scopes).strip(),
+        )
+
     @property
     def is_configured(self) -> bool:
         return bool(self.client_id and self.client_secret and self.redirect_uri)
@@ -55,6 +67,12 @@ class ZohoOAuthClient:
             "scopes": self.config.scopes,
             "redirect_uri": self.config.redirect_uri,
             "login_url": ZOHO_ACCOUNTS_ROOT,
+            "settings": {
+                "client_id": self.config.client_id,
+                "redirect_uri": self.config.redirect_uri,
+                "scopes": self.config.scopes,
+                "has_client_secret": bool(self.config.client_secret),
+            },
         }
 
     def authorization_url(self, state: str) -> str:
