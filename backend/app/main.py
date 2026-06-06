@@ -357,6 +357,32 @@ def page_shell(title: str, body: str, active: str = "") -> str:
     """
 
 
+def outlook_launch_page() -> str:
+    status = outlook_status()
+    redirect_uri = status.get("settings", {}).get("redirect_uri", "")
+    scopes = status.get("settings", {}).get("required_scopes", "")
+    body = f"""
+      <main class="auth-result">
+        <section class="connection-card">
+          <h1>Connect Outlook</h1>
+          <p>Use this fresh sign-in page to connect Microsoft Outlook to Accountant Supporter.</p>
+          <label>Redirect URI</label>
+          <input readonly value="{html.escape(redirect_uri)}" />
+          <label>Required scopes</label>
+          <input readonly value="{html.escape(scopes)}" />
+          <div class="toolbar">
+            <a class="button-link" href="/auth/outlook/start">Continue to Microsoft sign-in</a>
+            <a class="button-link secondary" href="/">Back to app</a>
+          </div>
+          <div class="notice">
+            Add the exact redirect URI above to the Microsoft Entra app registration for this client ID before signing in.
+          </div>
+        </section>
+      </main>
+    """
+    return page_shell("Connect Outlook", body, active="home")
+
+
 def index() -> str:
     body = """
       <main class="connection-main">
@@ -369,7 +395,7 @@ def index() -> str:
             <span class="pill" id="outlook-pill">Checking</span>
           </div>
           <div class="toolbar">
-            <a class="button-link" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Connect Outlook</a>
+            <a class="button-link" href="/auth/outlook/launch" target="_blank" rel="noopener noreferrer">Connect Outlook</a>
           </div>
           <div class="status" id="outlook-status">Checking status...</div>
           <div class="notice" id="outlook-config"></div>
@@ -714,6 +740,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/processing":
             self._send_html(processing_page())
             return
+        if path == "/auth/outlook/launch":
+            self._send_html(outlook_launch_page())
+            return
         if path == "/auth/outlook/start":
             self._auth_redirect(start_outlook_redirect_auth, "Mail setup needed")
             return
@@ -862,6 +891,8 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
     def _redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.FOUND)
         self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
