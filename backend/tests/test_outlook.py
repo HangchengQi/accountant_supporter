@@ -1,5 +1,6 @@
 import unittest
 
+from app.main import save_outlook_settings, storage
 from app.outlook import OutlookConfig, OutlookGraphClient
 
 
@@ -53,6 +54,25 @@ class OutlookConfigTest(unittest.TestCase):
         self.assertIn("redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fauth%2Foutlook%2Fcallback", url)
         self.assertIn("prompt=select_account", url)
         self.assertIn("state=state-value", url)
+
+    def test_save_outlook_settings_updates_client_and_tenant(self) -> None:
+        original = storage.get_connector_settings("outlook")
+        try:
+            status = save_outlook_settings(
+                {
+                    "client_id": "client-from-ui",
+                    "tenant_id": "common",
+                }
+            )
+
+            self.assertEqual(status["settings"]["client_id"], "client-from-ui")
+            self.assertEqual(status["settings"]["tenant_id"], "common")
+            self.assertIn("Mail.Send", status["settings"]["scopes"])
+        finally:
+            if original is not None:
+                storage.save_connector_settings("outlook", original)
+            else:
+                storage.delete_connector_settings("outlook")
 
 
 if __name__ == "__main__":

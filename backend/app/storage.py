@@ -242,6 +242,16 @@ class SQLiteStorage:
             return None
         return json.loads(row["settings_json"])
 
+    def delete_connector_settings(self, provider: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM connector_settings
+                WHERE provider = ?
+                """,
+                (provider,),
+            )
+
     def save_mail_message(
         self,
         provider: str,

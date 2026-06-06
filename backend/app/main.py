@@ -134,6 +134,7 @@ def outlook_status() -> dict[str, Any]:
         has_token=storage.get_oauth_token("outlook") is not None
     )
     status["settings"] = {
+        "client_id": client.config.client_id,
         "tenant_id": client.config.tenant_id,
         "scopes": client.config.scopes,
         "required_scopes": " ".join(required_scopes),
@@ -142,6 +143,44 @@ def outlook_status() -> dict[str, Any]:
         "saved_locally": bool(settings),
     }
     return status
+
+
+def save_outlook_settings(data: dict[str, Any]) -> dict[str, Any]:
+    existing = storage.get_connector_settings("outlook") or {}
+    env_config = OutlookConfig.from_env()
+    client_id = str(data.get("client_id", existing.get("client_id", env_config.client_id))).strip()
+    tenant_id = str(data.get("tenant_id", existing.get("tenant_id", env_config.tenant_id))).strip() or "common"
+    scopes = str(
+        existing.get("scopes")
+        or env_config.scopes
+        or "offline_access User.Read Mail.Read Mail.Send"
+    ).strip()
+    for scope in ["offline_access", "User.Read", "Mail.Read", "Mail.Send"]:
+        if scope not in scopes.split():
+            scopes = f"{scopes} {scope}".strip()
+    redirect_uri = str(
+        existing.get("redirect_uri")
+        or env_config.redirect_uri
+        or "http://127.0.0.1:8080/auth/outlook/callback"
+    ).strip()
+    client_secret = str(existing.get("client_secret", env_config.client_secret)).strip()
+
+    if not client_id:
+        raise ValueError("client_id is required")
+    if not tenant_id:
+        raise ValueError("tenant_id is required")
+
+    storage.save_connector_settings(
+        "outlook",
+        {
+            "client_id": client_id,
+            "tenant_id": tenant_id,
+            "scopes": scopes,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+        },
+    )
+    return outlook_status()
 
 
 def zoho_status() -> dict[str, Any]:
@@ -373,12 +412,14 @@ def index() -> str:
           </div>
           <div class="status" id="outlook-status">Checking status...</div>
           <div class="notice" id="outlook-config"></div>
-          <label for="log-receiver">Log Receiver</label>
-          <input id="log-receiver" type="email" autocomplete="off" placeholder="billing-log@example.com" />
+          <label for="outlook-client-id">Outlook Client ID</label>
+          <input id="outlook-client-id" autocomplete="off" placeholder="Microsoft app client ID" />
+          <label for="outlook-tenant-id">Outlook Tenant ID</label>
+          <input id="outlook-tenant-id" autocomplete="off" placeholder="common or tenant ID" />
           <div class="toolbar">
-            <button class="secondary" type="button" id="log-save">Save log receiver</button>
+            <button class="secondary" type="button" id="outlook-save">Save Outlook settings</button>
           </div>
-          <div class="status" id="log-status">Daily billing log receiver is not set.</div>
+          <div class="status" id="outlook-save-status"></div>
         </section>
 
         <section class="connection-card">
@@ -419,6 +460,22 @@ def index() -> str:
           </div>
           <div class="notice" id="ai-config"></div>
         </section>
+
+        <section class="connection-card">
+          <div class="connector-head">
+            <div>
+              <h2>Daily Billing Log</h2>
+              <p>Send the generated billing log to a receiver after bill emails are processed.</p>
+            </div>
+            <span class="pill" id="log-pill">Checking</span>
+          </div>
+          <label for="log-receiver">Log Receiver</label>
+          <input id="log-receiver" type="email" autocomplete="off" placeholder="billing-log@example.com" />
+          <div class="toolbar">
+            <button class="secondary" type="button" id="log-save">Save log receiver</button>
+          </div>
+          <div class="status" id="log-status">Daily billing log receiver is not set.</div>
+        </section>
       </main>
       <script>
         async function refreshConnectionStatus() {
@@ -431,9 +488,11 @@ def index() -> str:
           const target = document.getElementById('outlook-status');
           const pill = document.getElementById('outlook-pill');
           const config = document.getElementById('outlook-config');
+          document.getElementById('outlook-client-id').value = status.settings?.client_id || '';
+          document.getElementById('outlook-tenant-id').value = status.settings?.tenant_id || 'common';
           if (!status.configured) {
             target.textContent = 'Mail authentication is not configured by the app admin yet.';
-            config.textContent = 'Set OUTLOOK_CLIENT_ID and OUTLOOK_REDIRECT_URI, then restart the server.';
+            config.textContent = 'Enter the Outlook Client ID and Tenant ID, then save.';
             pill.textContent = 'Not configured';
             pill.className = 'pill';
             return;
@@ -448,6 +507,24 @@ def index() -> str:
           pill.className = status.connected ? 'pill ok' : 'pill';
           target.textContent = status.connected ? 'Outlook is connected' : 'Ready to connect Outlook';
         }
+
+        document.getElementById('outlook-save').addEventListener('click', async () => {
+          const response = await fetch('/api/outlook/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              client_id: document.getElementById('outlook-client-id').value,
+              tenant_id: document.getElementById('outlook-tenant-id').value
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            document.getElementById('outlook-save-status').textContent = result.error || 'Unable to save Outlook settings';
+            return;
+          }
+          document.getElementById('outlook-save-status').textContent = 'Outlook settings saved locally.';
+          await refreshOutlookStatus();
+        });
 
         async function refreshZohoStatus() {
           const response = await fetch('/api/zoho/status');
@@ -544,7 +621,10 @@ def index() -> str:
         async function refreshLogSettings() {
           const response = await fetch('/api/log/settings');
           const settings = await response.json();
+          const pill = document.getElementById('log-pill');
           document.getElementById('log-receiver').value = settings.receiver_email || '';
+          pill.textContent = settings.receiver_email ? 'Configured' : 'Not set';
+          pill.className = settings.receiver_email ? 'pill ok' : 'pill';
           document.getElementById('log-status').textContent = settings.receiver_email
             ? `Daily billing logs will be sent to ${settings.receiver_email}.`
             : 'Daily billing log receiver is not set.';
@@ -767,6 +847,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/outlook/auth/poll":
             try:
                 self._send_json(poll_outlook_auth())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/outlook/settings":
+            try:
+                self._send_json(save_outlook_settings(self._read_json()))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
