@@ -74,7 +74,7 @@ Then set these environment values before starting the local server:
 $env:OUTLOOK_CLIENT_ID="your-client-id"
 $env:OUTLOOK_CLIENT_SECRET="your-client-secret"
 $env:OUTLOOK_TENANT_ID="common"
-$env:OUTLOOK_SCOPES="offline_access User.Read Mail.Read"
+$env:OUTLOOK_SCOPES="offline_access User.Read Mail.Read Mail.Send"
 $env:OUTLOOK_REDIRECT_URI="http://127.0.0.1:8080/auth/outlook/callback"
 ```
 
@@ -86,6 +86,8 @@ python -m app.main
 ```
 
 Open `http://localhost:8080`, use the Mail Authentication panel to connect Outlook, then use the Processing page to fetch recent inbox messages.
+
+The `Mail.Send` scope is needed only for emailing the daily billing log. If this scope is added after a user already connected Outlook, reconnect Outlook so Microsoft grants the new permission.
 
 ## Zoho Books Connector
 
@@ -140,6 +142,8 @@ The Processing page can fetch Outlook messages into the queue and run a local qu
 
 - `GET /api/jobs/status`
 - `POST /api/jobs/run` with `{"max_jobs": 10}`
+
+When a bill-relevant Outlook email is processed, the app downloads file attachments, saves them under `data/bills/Billing{Email date}`, renames each bill file as `Vendor_InvoiceDate_InvoiceNumber.ext`, appends a daily markdown log under `data/logs`, and sends that log to the Log Receiver configured on the Connections page.
 
 ## Next Milestones
 

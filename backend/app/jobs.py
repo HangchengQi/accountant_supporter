@@ -148,7 +148,7 @@ def _classify_message(
 
 def _process_message(storage: SQLiteStorage, job: Job, process_email: Any) -> dict[str, Any]:
     message = _job_message(storage, job)
-    processed: ProcessedEmail = process_email(message.to_email())
+    processed: ProcessedEmail = process_email(message)
     return {
         "status": "processed",
         "processed_email_id": processed.id,

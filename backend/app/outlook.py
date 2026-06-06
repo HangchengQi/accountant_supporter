@@ -5,10 +5,11 @@ import json
 import os
 import re
 import time
+from base64 import b64decode
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -30,7 +31,7 @@ class OutlookConfig:
             tenant_id=os.getenv("OUTLOOK_TENANT_ID", "common").strip() or "common",
             scopes=os.getenv(
                 "OUTLOOK_SCOPES",
-                "offline_access User.Read Mail.Read",
+                "offline_access User.Read Mail.Read Mail.Send",
             ).strip(),
             client_secret=os.getenv("OUTLOOK_CLIENT_SECRET", "").strip(),
             redirect_uri=os.getenv(
@@ -87,6 +88,14 @@ class OutlookMessage:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class OutlookFileAttachment:
+    id: str
+    name: str
+    content_type: str
+    content: bytes
 
 
 class OutlookAuthError(Exception):
@@ -204,6 +213,55 @@ class OutlookGraphClient:
         response = self._get_graph(f"/me/mailFolders/Inbox/messages?{query}", token)
         return [self._parse_message(item) for item in response.get("value", [])]
 
+    def list_file_attachments(
+        self,
+        token: dict[str, Any],
+        message_id: str,
+    ) -> list[OutlookFileAttachment]:
+        encoded_id = quote(message_id, safe="")
+        query = urlencode(
+            {
+                "$select": "id,name,contentType,contentBytes",
+            }
+        )
+        response = self._get_graph(f"/me/messages/{encoded_id}/attachments?{query}", token)
+        attachments = []
+        for item in response.get("value", []):
+            if item.get("@odata.type") != "#microsoft.graph.fileAttachment":
+                continue
+            content = item.get("contentBytes")
+            if not content:
+                continue
+            attachments.append(
+                OutlookFileAttachment(
+                    id=item.get("id", ""),
+                    name=item.get("name", "attachment.bin") or "attachment.bin",
+                    content_type=item.get("contentType", "") or "",
+                    content=b64decode(content),
+                )
+            )
+        return attachments
+
+    def send_mail(self, token: dict[str, Any], to_address: str, subject: str, body: str) -> None:
+        payload = {
+            "message": {
+                "subject": subject,
+                "body": {
+                    "contentType": "Text",
+                    "content": body,
+                },
+                "toRecipients": [
+                    {
+                        "emailAddress": {
+                            "address": to_address,
+                        }
+                    }
+                ],
+            },
+            "saveToSentItems": True,
+        }
+        self._post_graph("/me/sendMail", token, payload)
+
     def _parse_message(self, item: dict[str, Any]) -> OutlookMessage:
         sender = (
             item.get("from", {})
@@ -233,6 +291,18 @@ class OutlookGraphClient:
         )
         return self._open_json(request)
 
+    def _post_graph(self, path: str, token: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        request = Request(
+            f"{GRAPH_ROOT}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token['access_token']}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        return self._open_json(request)
+
     def _post_form(self, url: str, data: dict[str, str]) -> dict[str, Any]:
         body = urlencode(data).encode("utf-8")
         request = Request(
@@ -252,7 +322,8 @@ class OutlookGraphClient:
     def _open_json(self, request: Request) -> dict[str, Any]:
         try:
             with urlopen(request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body else {}
         except HTTPError as exc:
             payload = exc.read().decode("utf-8")
             try:

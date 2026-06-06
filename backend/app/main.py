@@ -16,9 +16,10 @@ from .ai import (
     ai_status,
     create_ai_processor,
 )
+from .billing import BillAttachment, save_billing_artifacts
 from .jobs import enqueue_mail_message, queue_status, run_queue_once
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
-from .schemas import EmailSampleIn, ProcessedEmail
+from .schemas import EmailSampleIn, MailMessage, ProcessedEmail
 from .storage import SQLiteStorage
 from .workflow import Workflow, load_workflow
 from .zoho import DryRunZohoBooksClient, ZohoConfig, ZohoOAuthClient
@@ -30,6 +31,14 @@ def get_database_path() -> str:
 
 def get_workflow_path() -> str:
     return os.getenv("WORKFLOW_PATH", "../workflows/vendor_invoice.v1.json")
+
+
+def get_bills_root() -> str:
+    return os.getenv("BILLS_ROOT", "./data/bills")
+
+
+def get_logs_root() -> str:
+    return os.getenv("BILLING_LOGS_ROOT", "./data/logs")
 
 
 storage = SQLiteStorage(get_database_path())
@@ -64,6 +73,42 @@ def process_email_sample(email: EmailSampleIn) -> ProcessedEmail:
         zoho_status=zoho_status,
         zoho_payload=zoho_payload,
     )
+
+
+def process_mail_message(message: MailMessage) -> ProcessedEmail:
+    record = process_email_sample(message.to_email())
+    if message.provider == "outlook":
+        _handle_outlook_billing_artifacts(message, record)
+    return record
+
+
+def _handle_outlook_billing_artifacts(message: MailMessage, record: ProcessedEmail) -> None:
+    token = get_outlook_token()
+    client = get_outlook_client()
+    attachments = [
+        BillAttachment(name=attachment.name, content=attachment.content)
+        for attachment in client.list_file_attachments(token, message.provider_message_id)
+    ]
+    artifacts = save_billing_artifacts(
+        message=message,
+        processed=record,
+        attachments=attachments,
+        bills_root=get_bills_root(),
+        logs_root=get_logs_root(),
+    )
+    receiver = log_settings()["receiver_email"]
+    if receiver:
+        email_date = artifacts.daily_log.stem.replace("billing-log-", "", 1)
+        try:
+            client.send_mail(
+                token=token,
+                to_address=receiver,
+                subject=f"Daily billing log {email_date}",
+                body=artifacts.daily_log.read_text(encoding="utf-8"),
+            )
+        except Exception as exc:
+            with artifacts.daily_log.open("a", encoding="utf-8") as f:
+                f.write(f"- Log email send failed: {exc}\n\n")
 
 
 def list_processed_emails() -> list[ProcessedEmail]:
@@ -132,6 +177,22 @@ def save_ai_settings(data: dict[str, Any]) -> dict[str, Any]:
     }
     storage.save_connector_settings("ai", settings)
     return get_ai_status()
+
+
+def log_settings() -> dict[str, Any]:
+    settings = storage.get_connector_settings("billing_log") or {}
+    return {
+        "receiver_email": settings.get("receiver_email", ""),
+        "saved_locally": bool(settings),
+    }
+
+
+def save_log_settings(data: dict[str, Any]) -> dict[str, Any]:
+    receiver_email = str(data.get("receiver_email", "")).strip()
+    if receiver_email and ("@" not in receiver_email or len(receiver_email) > 320):
+        raise ValueError("receiver_email must be a valid email address")
+    storage.save_connector_settings("billing_log", {"receiver_email": receiver_email})
+    return log_settings()
 
 
 def start_outlook_redirect_auth() -> str:
@@ -256,7 +317,7 @@ def ingest_outlook_messages(top: int = 10) -> dict[str, Any]:
 def run_jobs(max_jobs: int = 10) -> dict[str, Any]:
     return run_queue_once(
         storage,
-        process_email_sample,
+        process_mail_message,
         max_jobs=max_jobs,
         ai_settings=storage.get_connector_settings("ai"),
     ).to_dict()
@@ -308,6 +369,12 @@ def index() -> str:
           </div>
           <div class="status" id="outlook-status">Checking status...</div>
           <div class="notice" id="outlook-config"></div>
+          <label for="log-receiver">Log Receiver</label>
+          <input id="log-receiver" type="email" autocomplete="off" placeholder="billing-log@example.com" />
+          <div class="toolbar">
+            <button class="secondary" type="button" id="log-save">Save log receiver</button>
+          </div>
+          <div class="status" id="log-status">Daily billing log receiver is not set.</div>
         </section>
 
         <section class="connection-card">
@@ -351,7 +418,7 @@ def index() -> str:
       </main>
       <script>
         async function refreshConnectionStatus() {
-          await Promise.all([refreshOutlookStatus(), refreshZohoStatus(), refreshAIStatus()]);
+          await Promise.all([refreshOutlookStatus(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings()]);
         }
 
         async function refreshOutlookStatus() {
@@ -463,6 +530,31 @@ def index() -> str:
             return;
           }
           await refreshAIStatus();
+        });
+
+        async function refreshLogSettings() {
+          const response = await fetch('/api/log/settings');
+          const settings = await response.json();
+          document.getElementById('log-receiver').value = settings.receiver_email || '';
+          document.getElementById('log-status').textContent = settings.receiver_email
+            ? `Daily billing logs will be sent to ${settings.receiver_email}.`
+            : 'Daily billing log receiver is not set.';
+        }
+
+        document.getElementById('log-save').addEventListener('click', async () => {
+          const response = await fetch('/api/log/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              receiver_email: document.getElementById('log-receiver').value
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            document.getElementById('log-status').textContent = result.error || 'Unable to save log receiver';
+            return;
+          }
+          await refreshLogSettings();
         });
 
         refreshConnectionStatus();
@@ -644,6 +736,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/ai/status":
             self._send_json(get_ai_status())
             return
+        if path == "/api/log/settings":
+            self._send_json(log_settings())
+            return
         if path == "/api/outlook/messages":
             self._send_outlook_messages()
             return
@@ -669,6 +764,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/ai/settings":
             try:
                 self._send_json(save_ai_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/log/settings":
+            try:
+                self._send_json(save_log_settings(self._read_json()))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return

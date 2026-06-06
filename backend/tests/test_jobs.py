@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from app.jobs import PROCESS_EMAIL, enqueue_mail_message, run_queue_once
-from app.schemas import EmailSampleIn
+from app.schemas import MailMessage
 from app.storage import SQLiteStorage
 
 
@@ -34,8 +34,8 @@ class JobQueueTest(unittest.TestCase):
     def test_queue_processes_relevant_email_after_classification(self) -> None:
         processed_subjects = []
 
-        def process(email: EmailSampleIn) -> object:
-            processed_subjects.append(email.subject)
+        def process(message: MailMessage) -> object:
+            processed_subjects.append(message.subject)
             return type("Processed", (), {"id": 42})()
 
         with tempfile.TemporaryDirectory() as directory:
@@ -105,7 +105,7 @@ class JobQueueTest(unittest.TestCase):
             self.assertEqual(len(storage.list_mail_messages()), 1)
             self.assertEqual(second.subject, "Invoice A updated")
 
-    def _fake_process(self, email: EmailSampleIn) -> object:
+    def _fake_process(self, message: MailMessage) -> object:
         return type("Processed", (), {"id": 1})()
 
 
