@@ -128,12 +128,16 @@ def get_zoho_oauth_client() -> ZohoOAuthClient:
 def outlook_status() -> dict[str, Any]:
     settings = storage.get_connector_settings("outlook") or {}
     client = get_outlook_client()
+    required_scopes = ["offline_access", "User.Read", "Mail.Read", "Mail.Send"]
+    configured_scopes = set(client.config.scopes.split())
     status = client.configured_status(
         has_token=storage.get_oauth_token("outlook") is not None
     )
     status["settings"] = {
         "tenant_id": client.config.tenant_id,
         "scopes": client.config.scopes,
+        "required_scopes": " ".join(required_scopes),
+        "missing_scopes": [scope for scope in required_scopes if scope not in configured_scopes],
         "redirect_uri": client.config.redirect_uri,
         "saved_locally": bool(settings),
     }
@@ -434,7 +438,12 @@ def index() -> str:
             pill.className = 'pill';
             return;
           }
-          config.textContent = `Redirect URI: ${status.settings?.redirect_uri || ''}`;
+          const missingScopes = status.settings?.missing_scopes || [];
+          const scopeMessage = missingScopes.length
+            ? ` Missing scopes: ${missingScopes.join(', ')}. Reconnect Outlook after updating scopes.`
+            : '';
+          config.textContent =
+            `Redirect URI: ${status.settings?.redirect_uri || ''} | Required scopes: ${status.settings?.required_scopes || ''}.${scopeMessage}`;
           pill.textContent = status.connected ? 'Connected' : 'Configured';
           pill.className = status.connected ? 'pill ok' : 'pill';
           target.textContent = status.connected ? 'Outlook is connected' : 'Ready to connect Outlook';
