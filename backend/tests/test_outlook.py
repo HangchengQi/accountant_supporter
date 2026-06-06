@@ -51,6 +51,7 @@ class OutlookConfigTest(unittest.TestCase):
         self.assertIn("response_type=code", url)
         self.assertIn("client_id=abc-123", url)
         self.assertIn("redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fauth%2Foutlook%2Fcallback", url)
+        self.assertIn("prompt=select_account", url)
         self.assertIn("state=state-value", url)
 
 

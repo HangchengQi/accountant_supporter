@@ -125,6 +125,7 @@ class OutlookGraphClient:
                 "response_mode": "query",
                 "scope": self.config.scopes,
                 "state": state,
+                "prompt": "select_account",
             }
         )
         return f"{self._auth_url('authorize')}?{query}"
