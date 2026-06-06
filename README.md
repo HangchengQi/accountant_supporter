@@ -85,7 +85,7 @@ cd accountant_supporter\backend
 python -m app.main
 ```
 
-Open `http://localhost:8080`, use the Mail Authentication panel to connect Outlook, then use the Processing page to fetch recent inbox messages.
+Open `http://localhost:8080`, use the Mail Authentication panel to connect Outlook, then use the Processing page to fetch recent inbox messages. The primary Connect Outlook action uses Microsoft device-code sign-in, which does not require a reply URL. A redirect sign-in fallback is also available for app registrations with a working Web redirect URI.
 
 The `Mail.Send` scope is needed only for emailing the daily billing log. If this scope is added after a user already connected Outlook, reconnect Outlook so Microsoft grants the new permission.
 

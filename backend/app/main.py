@@ -421,10 +421,12 @@ def index() -> str:
             <span class="pill" id="outlook-pill">Checking</span>
           </div>
           <div class="toolbar">
-            <a class="button-link" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Connect Outlook</a>
+            <button type="button" id="outlook-device-connect">Connect Outlook</button>
+            <a class="button-link secondary" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Redirect sign-in</a>
           </div>
           <div class="status" id="outlook-status">Checking status...</div>
           <div class="notice" id="outlook-config"></div>
+          <div class="notice" id="outlook-device-code" style="display:none"></div>
           <label for="outlook-client-id">Outlook Client ID</label>
           <input id="outlook-client-id" autocomplete="off" placeholder="Microsoft app client ID" />
           <label for="outlook-account-type">Outlook Login Type</label>
@@ -544,6 +546,46 @@ def index() -> str:
         }
 
         document.getElementById('outlook-account-type').addEventListener('change', syncOutlookTenantInput);
+
+        document.getElementById('outlook-device-connect').addEventListener('click', async () => {
+          const response = await fetch('/api/outlook/auth/start', { method: 'POST' });
+          const result = await response.json();
+          const codePanel = document.getElementById('outlook-device-code');
+          if (!response.ok) {
+            codePanel.style.display = 'block';
+            codePanel.textContent = result.error || 'Unable to start Outlook sign-in';
+            return;
+          }
+          codePanel.style.display = 'block';
+          codePanel.innerHTML =
+            `Open Microsoft sign-in and enter code <strong>${result.user_code}</strong>. ` +
+            `<a href="${result.verification_uri}" target="_blank" rel="noopener noreferrer">Open sign-in page</a>`;
+          window.open(result.verification_uri, '_blank', 'noopener,noreferrer');
+          pollOutlookDeviceCode(result.interval || 5);
+        });
+
+        async function pollOutlookDeviceCode(intervalSeconds) {
+          const codePanel = document.getElementById('outlook-device-code');
+          const poll = async () => {
+            const response = await fetch('/api/outlook/auth/poll', { method: 'POST' });
+            const result = await response.json();
+            if (!response.ok) {
+              codePanel.textContent = result.error || 'Unable to finish Outlook sign-in';
+              return;
+            }
+            if (result.status === 'connected') {
+              codePanel.textContent = 'Outlook connected.';
+              await refreshOutlookStatus();
+              return;
+            }
+            if (result.status === 'expired') {
+              codePanel.textContent = 'Outlook sign-in expired. Click Connect Outlook again.';
+              return;
+            }
+            setTimeout(poll, Math.max(2, intervalSeconds) * 1000);
+          };
+          setTimeout(poll, Math.max(2, intervalSeconds) * 1000);
+        }
 
         document.getElementById('outlook-save').addEventListener('click', async () => {
           const response = await fetch('/api/outlook/settings', {
