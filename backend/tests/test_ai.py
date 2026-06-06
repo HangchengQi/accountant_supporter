@@ -97,6 +97,17 @@ class AIConfigTest(unittest.TestCase):
         self.assertEqual(status["job_models"]["classify_email"], "simple-model")
         self.assertEqual(status["job_models"]["process_email"], "strong-model")
 
+    def test_status_uses_default_models_by_job_type(self) -> None:
+        status = ai_status(
+            {
+                "provider": "openai",
+                "openai_api_key": "saved-key",
+            }
+        )
+
+        self.assertEqual(status["job_models"]["classify_email"], "gpt-5.4-mini")
+        self.assertEqual(status["job_models"]["process_email"], "gpt-5.5")
+
     def test_openai_processor_uses_workflow_ai_instructions(self) -> None:
         workflow = Workflow(
             name="vendor_invoice_email",

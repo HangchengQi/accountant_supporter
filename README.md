@@ -111,7 +111,7 @@ This MVP assumes US Zoho accounts and redirects users to `https://accounts.zoho.
 By default, the app uses a local heuristic processor. To use ChatGPT/OpenAI for email summaries and structured invoice extraction, open the Connections page and save:
 
 - AI Provider: `openai`
-- OpenAI Model, for example `gpt-5.2`
+- OpenAI Model, for example `gpt-5.5`
 - Classification Model, a cheaper/faster model for `classify_email` jobs
 - OpenAI API Key
 
@@ -120,8 +120,8 @@ Environment variables are still supported for scripted local installs:
 ```powershell
 $env:AI_PROVIDER="openai"
 $env:OPENAI_API_KEY="your-openai-api-key"
-$env:OPENAI_MODEL="gpt-5.2"
-$env:OPENAI_CLASSIFICATION_MODEL="your-cheaper-classification-model"
+$env:OPENAI_MODEL="gpt-5.5"
+$env:OPENAI_CLASSIFICATION_MODEL="gpt-5.4-mini"
 ```
 
 The Connections page shows whether the active processor is local or OpenAI.

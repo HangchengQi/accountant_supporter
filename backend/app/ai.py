@@ -12,6 +12,10 @@ from .schemas import EmailSampleIn, ExtractedFields
 from .workflow import Workflow
 
 
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
+DEFAULT_OPENAI_CLASSIFICATION_MODEL = "gpt-5.4-mini"
+
+
 @dataclass(frozen=True)
 class AIResult:
     summary: str
@@ -44,7 +48,7 @@ class OpenAIConfig:
     def from_env(cls) -> "OpenAIConfig":
         return cls(
             api_key=os.getenv("OPENAI_API_KEY", "").strip(),
-            model=os.getenv("OPENAI_MODEL", "gpt-5.2").strip() or "gpt-5.2",
+            model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL,
         )
 
     @classmethod
@@ -53,14 +57,16 @@ class OpenAIConfig:
         settings: dict[str, Any] | None,
         model_key: str = "openai_model",
         env_model_key: str = "OPENAI_MODEL",
+        default_model: str | None = None,
     ) -> "OpenAIConfig":
         env_config = cls.from_env()
         env_model = os.getenv(env_model_key, "").strip()
+        fallback_model = default_model or env_config.model
         if not settings:
-            return cls(api_key=env_config.api_key, model=env_model or env_config.model)
+            return cls(api_key=env_config.api_key, model=env_model or fallback_model)
         return cls(
             api_key=str(settings.get("openai_api_key") or env_config.api_key).strip(),
-            model=str(settings.get(model_key) or env_model or env_config.model).strip() or "gpt-5.2",
+            model=str(settings.get(model_key) or env_model or fallback_model).strip() or fallback_model,
         )
 
     @property
@@ -297,6 +303,7 @@ def ai_status(settings: dict[str, Any] | None = None) -> dict[str, Any]:
         settings,
         model_key="openai_classification_model",
         env_model_key="OPENAI_CLASSIFICATION_MODEL",
+        default_model=DEFAULT_OPENAI_CLASSIFICATION_MODEL,
     )
     provider = _provider(settings)
     active_provider = "openai" if provider in {"openai", "chatgpt"} and config.is_configured else "local"
@@ -334,6 +341,7 @@ def classify_email(email: EmailSampleIn, settings: dict[str, Any] | None = None)
         settings,
         model_key="openai_classification_model",
         env_model_key="OPENAI_CLASSIFICATION_MODEL",
+        default_model=DEFAULT_OPENAI_CLASSIFICATION_MODEL,
     )
     if not config.is_configured:
         return rule_result

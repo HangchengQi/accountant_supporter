@@ -10,7 +10,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .ai import ai_status, create_ai_processor
+from .ai import (
+    DEFAULT_OPENAI_CLASSIFICATION_MODEL,
+    DEFAULT_OPENAI_MODEL,
+    ai_status,
+    create_ai_processor,
+)
 from .jobs import enqueue_mail_message, queue_status, run_queue_once
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
 from .schemas import EmailSampleIn, ProcessedEmail
@@ -102,11 +107,11 @@ def get_ai_status() -> dict[str, Any]:
 def save_ai_settings(data: dict[str, Any]) -> dict[str, Any]:
     existing = storage.get_connector_settings("ai") or {}
     provider = str(data.get("provider", existing.get("provider", "local"))).strip().lower()
-    model = str(data.get("openai_model", existing.get("openai_model", "gpt-5.2"))).strip()
+    model = str(data.get("openai_model", existing.get("openai_model", DEFAULT_OPENAI_MODEL))).strip()
     classification_model = str(
         data.get(
             "openai_classification_model",
-            existing.get("openai_classification_model", model),
+            existing.get("openai_classification_model", DEFAULT_OPENAI_CLASSIFICATION_MODEL),
         )
     ).strip()
     api_key = str(data.get("openai_api_key", "")).strip()
@@ -332,9 +337,9 @@ def index() -> str:
           <label for="ai-provider">AI Provider</label>
           <input id="ai-provider" autocomplete="off" placeholder="local or openai" />
           <label for="openai-model">OpenAI Model</label>
-          <input id="openai-model" autocomplete="off" placeholder="gpt-5.2" />
+          <input id="openai-model" autocomplete="off" placeholder="gpt-5.5" />
           <label for="openai-classification-model">Classification Model</label>
-          <input id="openai-classification-model" autocomplete="off" placeholder="Use a cheaper model for classify_email" />
+          <input id="openai-classification-model" autocomplete="off" placeholder="gpt-5.4-mini" />
           <label for="openai-api-key">OpenAI API Key</label>
           <input id="openai-api-key" type="password" autocomplete="off" placeholder="Paste key to save or rotate" />
           <div class="toolbar">
@@ -401,9 +406,9 @@ def index() -> str:
           const pill = document.getElementById('ai-pill');
           const config = document.getElementById('ai-config');
           document.getElementById('ai-provider').value = status.settings?.provider || 'local';
-          document.getElementById('openai-model').value = status.settings?.openai_model || 'gpt-5.2';
+          document.getElementById('openai-model').value = status.settings?.openai_model || 'gpt-5.5';
           document.getElementById('openai-classification-model').value =
-            status.settings?.openai_classification_model || status.settings?.openai_model || 'gpt-5.2';
+            status.settings?.openai_classification_model || 'gpt-5.4-mini';
           document.getElementById('openai-api-key').value = '';
           if (status.active_provider === 'openai') {
             pill.textContent = 'OpenAI';
