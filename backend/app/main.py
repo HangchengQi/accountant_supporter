@@ -365,7 +365,7 @@ def index() -> str:
             <span class="pill" id="outlook-pill">Checking</span>
           </div>
           <div class="toolbar">
-            <a class="button-link" href="/auth/outlook/start">Connect Outlook</a>
+            <a class="button-link" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Connect Outlook</a>
           </div>
           <div class="status" id="outlook-status">Checking status...</div>
           <div class="notice" id="outlook-config"></div>
