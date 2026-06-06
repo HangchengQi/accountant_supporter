@@ -61,6 +61,7 @@ class OutlookConfigTest(unittest.TestCase):
             status = save_outlook_settings(
                 {
                     "client_id": "client-from-ui",
+                    "account_type": "custom",
                     "tenant_id": "common",
                 }
             )
@@ -68,6 +69,25 @@ class OutlookConfigTest(unittest.TestCase):
             self.assertEqual(status["settings"]["client_id"], "client-from-ui")
             self.assertEqual(status["settings"]["tenant_id"], "common")
             self.assertIn("Mail.Send", status["settings"]["scopes"])
+        finally:
+            if original is not None:
+                storage.save_connector_settings("outlook", original)
+            else:
+                storage.delete_connector_settings("outlook")
+
+    def test_save_outlook_settings_supports_common_login_option(self) -> None:
+        original = storage.get_connector_settings("outlook")
+        try:
+            status = save_outlook_settings(
+                {
+                    "client_id": "client-from-ui",
+                    "account_type": "common",
+                    "tenant_id": "ignored-tenant",
+                }
+            )
+
+            self.assertEqual(status["settings"]["tenant_id"], "common")
+            self.assertEqual(status["settings"]["account_type"], "common")
         finally:
             if original is not None:
                 storage.save_connector_settings("outlook", original)

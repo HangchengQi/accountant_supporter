@@ -136,6 +136,7 @@ def outlook_status() -> dict[str, Any]:
     status["settings"] = {
         "client_id": client.config.client_id,
         "tenant_id": client.config.tenant_id,
+        "account_type": _outlook_account_type(client.config.tenant_id),
         "scopes": client.config.scopes,
         "required_scopes": " ".join(required_scopes),
         "missing_scopes": [scope for scope in required_scopes if scope not in configured_scopes],
@@ -149,7 +150,12 @@ def save_outlook_settings(data: dict[str, Any]) -> dict[str, Any]:
     existing = storage.get_connector_settings("outlook") or {}
     env_config = OutlookConfig.from_env()
     client_id = str(data.get("client_id", existing.get("client_id", env_config.client_id))).strip()
+    account_type = str(data.get("account_type", "")).strip().lower()
     tenant_id = str(data.get("tenant_id", existing.get("tenant_id", env_config.tenant_id))).strip() or "common"
+    if account_type in {"common", "organizations", "consumers"}:
+        tenant_id = account_type
+    elif account_type == "custom":
+        tenant_id = tenant_id or "common"
     scopes = str(
         existing.get("scopes")
         or env_config.scopes
@@ -175,12 +181,19 @@ def save_outlook_settings(data: dict[str, Any]) -> dict[str, Any]:
         {
             "client_id": client_id,
             "tenant_id": tenant_id,
+            "account_type": _outlook_account_type(tenant_id),
             "scopes": scopes,
             "client_secret": client_secret,
             "redirect_uri": redirect_uri,
         },
     )
     return outlook_status()
+
+
+def _outlook_account_type(tenant_id: str) -> str:
+    if tenant_id in {"common", "organizations", "consumers"}:
+        return tenant_id
+    return "custom"
 
 
 def zoho_status() -> dict[str, Any]:
@@ -414,6 +427,13 @@ def index() -> str:
           <div class="notice" id="outlook-config"></div>
           <label for="outlook-client-id">Outlook Client ID</label>
           <input id="outlook-client-id" autocomplete="off" placeholder="Microsoft app client ID" />
+          <label for="outlook-account-type">Outlook Login Type</label>
+          <select id="outlook-account-type">
+            <option value="common">Common login: work, school, or personal Microsoft</option>
+            <option value="organizations">Work or school accounts only</option>
+            <option value="consumers">Personal Microsoft accounts only</option>
+            <option value="custom">Specific business tenant</option>
+          </select>
           <label for="outlook-tenant-id">Outlook Tenant ID</label>
           <input id="outlook-tenant-id" autocomplete="off" placeholder="common or tenant ID" />
           <div class="toolbar">
@@ -489,7 +509,9 @@ def index() -> str:
           const pill = document.getElementById('outlook-pill');
           const config = document.getElementById('outlook-config');
           document.getElementById('outlook-client-id').value = status.settings?.client_id || '';
+          document.getElementById('outlook-account-type').value = status.settings?.account_type || 'common';
           document.getElementById('outlook-tenant-id').value = status.settings?.tenant_id || 'common';
+          syncOutlookTenantInput();
           if (!status.configured) {
             target.textContent = 'Mail authentication is not configured by the app admin yet.';
             config.textContent = 'Enter the Outlook Client ID and Tenant ID, then save.';
@@ -508,12 +530,28 @@ def index() -> str:
           target.textContent = status.connected ? 'Outlook is connected' : 'Ready to connect Outlook';
         }
 
+        function syncOutlookTenantInput() {
+          const accountType = document.getElementById('outlook-account-type').value;
+          const tenant = document.getElementById('outlook-tenant-id');
+          if (accountType === 'custom') {
+            tenant.disabled = false;
+            tenant.placeholder = 'Business tenant ID';
+            return;
+          }
+          tenant.value = accountType;
+          tenant.disabled = true;
+          tenant.placeholder = accountType;
+        }
+
+        document.getElementById('outlook-account-type').addEventListener('change', syncOutlookTenantInput);
+
         document.getElementById('outlook-save').addEventListener('click', async () => {
           const response = await fetch('/api/outlook/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               client_id: document.getElementById('outlook-client-id').value,
+              account_type: document.getElementById('outlook-account-type').value,
               tenant_id: document.getElementById('outlook-tenant-id').value
             })
           });
@@ -1091,7 +1129,7 @@ def base_css() -> str:
         font-weight: 650;
         font-size: 14px;
       }
-      input, textarea {
+      input, select, textarea {
         width: 100%;
         border: 1px solid #bdc9d1;
         border-radius: 6px;
