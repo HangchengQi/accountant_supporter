@@ -484,26 +484,29 @@ def index() -> str:
             </div>
             <span class="pill" id="outlook-pill">Checking</span>
           </div>
+          <label for="outlook-account-type">Outlook Account Type</label>
+          <select id="outlook-account-type">
+            <option value="personal">Personal Outlook account</option>
+            <option value="common">Microsoft app: work, school, or personal</option>
+            <option value="organizations">Microsoft app: work or school only</option>
+            <option value="custom">Microsoft app: specific business tenant</option>
+          </select>
+          <div class="notice" id="outlook-mode-note"></div>
           <div class="toolbar">
             <button type="button" id="outlook-device-connect">Connect Outlook</button>
-            <a class="button-link secondary" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Redirect sign-in</a>
+            <a class="button-link secondary" id="outlook-redirect-connect" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Redirect sign-in</a>
           </div>
           <div class="status" id="outlook-status">Checking status...</div>
           <div class="notice" id="outlook-config"></div>
           <div class="notice" id="outlook-device-code" style="display:none"></div>
-          <label for="outlook-client-id">Outlook Client ID</label>
-          <input id="outlook-client-id" autocomplete="off" placeholder="Microsoft app client ID" />
-          <label for="outlook-account-type">Outlook Login Type</label>
-          <select id="outlook-account-type">
-            <option value="common">Common login: work, school, or personal Microsoft</option>
-            <option value="organizations">Work or school accounts only</option>
-            <option value="consumers">Personal Microsoft accounts only</option>
-            <option value="custom">Specific business tenant</option>
-          </select>
-          <label for="outlook-tenant-id">Outlook Tenant ID</label>
-          <input id="outlook-tenant-id" autocomplete="off" placeholder="common or tenant ID" />
-          <div class="toolbar">
-            <button class="secondary" type="button" id="outlook-save">Save Outlook settings</button>
+          <div id="outlook-app-fields">
+            <label for="outlook-client-id">Microsoft App Client ID</label>
+            <input id="outlook-client-id" autocomplete="off" placeholder="Application (client) ID from app registration" />
+            <label for="outlook-tenant-id">Tenant or Login Audience</label>
+            <input id="outlook-tenant-id" autocomplete="off" placeholder="common or tenant ID" />
+            <div class="toolbar">
+              <button class="secondary" type="button" id="outlook-save">Save Outlook settings</button>
+            </div>
           </div>
           <div class="status" id="outlook-save-status"></div>
         </section>
@@ -587,12 +590,13 @@ def index() -> str:
           const pill = document.getElementById('outlook-pill');
           const config = document.getElementById('outlook-config');
           document.getElementById('outlook-client-id').value = status.settings?.client_id || '';
-          document.getElementById('outlook-account-type').value = status.settings?.account_type || 'common';
+          document.getElementById('outlook-account-type').value =
+            status.configured ? (status.settings?.account_type || 'common') : 'personal';
           document.getElementById('outlook-tenant-id').value = status.settings?.tenant_id || 'common';
-          syncOutlookTenantInput();
+          syncOutlookMode();
           if (!status.configured) {
-            target.textContent = 'Mail authentication is not configured by the app admin yet.';
-            config.textContent = 'Enter the Outlook Client ID and Tenant ID, then save.';
+            target.textContent = 'Mail authentication is not configured for direct local OAuth.';
+            config.textContent = 'Personal Outlook mailboxes do not have a Client ID. Use the plugin-backed workflow for MVP testing, or choose a Microsoft app mode if you have an app registration.';
             pill.textContent = 'Not configured';
             pill.className = 'pill';
             return;
@@ -608,20 +612,47 @@ def index() -> str:
           target.textContent = status.connected ? 'Outlook is connected' : 'Ready to connect Outlook';
         }
 
-        function syncOutlookTenantInput() {
+        function syncOutlookMode() {
           const accountType = document.getElementById('outlook-account-type').value;
+          const fields = document.getElementById('outlook-app-fields');
           const tenant = document.getElementById('outlook-tenant-id');
+          const clientId = document.getElementById('outlook-client-id');
+          const note = document.getElementById('outlook-mode-note');
+          const deviceConnect = document.getElementById('outlook-device-connect');
+          const redirectConnect = document.getElementById('outlook-redirect-connect');
+          if (accountType === 'personal') {
+            fields.style.display = 'none';
+            clientId.value = '';
+            tenant.value = 'consumers';
+            note.textContent = 'A personal Outlook mailbox has no Client ID. Direct local OAuth needs a Microsoft app registration owned by the app; for MVP testing, use the already connected Outlook plugin workflow.';
+            deviceConnect.disabled = true;
+            redirectConnect.removeAttribute('href');
+            redirectConnect.setAttribute('aria-disabled', 'true');
+            redirectConnect.className = 'button-link secondary disabled';
+            return;
+          }
+          fields.style.display = 'block';
+          deviceConnect.disabled = false;
+          redirectConnect.setAttribute('href', '/auth/outlook/start');
+          redirectConnect.removeAttribute('aria-disabled');
+          redirectConnect.className = 'button-link secondary';
           if (accountType === 'custom') {
             tenant.disabled = false;
             tenant.placeholder = 'Business tenant ID';
+            note.textContent = 'Use this for a single business tenant app registration.';
             return;
           }
           tenant.value = accountType;
           tenant.disabled = true;
           tenant.placeholder = accountType;
+          if (accountType === 'common') {
+            note.textContent = 'Use this when your Microsoft app registration supports work, school, and personal Microsoft accounts.';
+            return;
+          }
+          note.textContent = 'Use this when your Microsoft app registration supports work or school accounts only.';
         }
 
-        document.getElementById('outlook-account-type').addEventListener('change', syncOutlookTenantInput);
+        document.getElementById('outlook-account-type').addEventListener('change', syncOutlookMode);
 
         document.getElementById('outlook-device-connect').addEventListener('click', async () => {
           const response = await fetch('/api/outlook/auth/start', { method: 'POST' });
@@ -664,6 +695,11 @@ def index() -> str:
         }
 
         document.getElementById('outlook-save').addEventListener('click', async () => {
+          if (document.getElementById('outlook-account-type').value === 'personal') {
+            document.getElementById('outlook-save-status').textContent =
+              'No Outlook app settings are required for a personal mailbox. Use plugin-backed import until a Microsoft app registration is available.';
+            return;
+          }
           const response = await fetch('/api/outlook/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
