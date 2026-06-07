@@ -492,10 +492,11 @@ def index() -> str:
             <option value="custom">Microsoft app: specific business tenant</option>
           </select>
           <div class="notice" id="outlook-mode-note"></div>
-          <div class="toolbar">
+          <div class="toolbar" id="outlook-connect-toolbar">
             <button type="button" id="outlook-device-connect">Connect Outlook</button>
             <a class="button-link secondary" id="outlook-redirect-connect" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Redirect sign-in</a>
           </div>
+          <div class="notice" id="outlook-personal-action" style="display:none"></div>
           <div class="status" id="outlook-status">Checking status...</div>
           <div class="notice" id="outlook-config"></div>
           <div class="notice" id="outlook-device-code" style="display:none"></div>
@@ -620,11 +621,16 @@ def index() -> str:
           const note = document.getElementById('outlook-mode-note');
           const deviceConnect = document.getElementById('outlook-device-connect');
           const redirectConnect = document.getElementById('outlook-redirect-connect');
+          const connectToolbar = document.getElementById('outlook-connect-toolbar');
+          const personalAction = document.getElementById('outlook-personal-action');
           if (accountType === 'personal') {
             fields.style.display = 'none';
             clientId.value = '';
             tenant.value = 'consumers';
             note.textContent = 'A personal Outlook mailbox has no Client ID. Direct local OAuth needs a Microsoft app registration owned by the app; for MVP testing, use the already connected Outlook plugin workflow.';
+            connectToolbar.style.display = 'none';
+            personalAction.style.display = 'block';
+            personalAction.textContent = 'Direct local Outlook connection is unavailable in personal mailbox mode. The MVP can still read your personal Outlook through the connected Codex Outlook plugin during testing.';
             deviceConnect.disabled = true;
             redirectConnect.removeAttribute('href');
             redirectConnect.setAttribute('aria-disabled', 'true');
@@ -632,6 +638,8 @@ def index() -> str:
             return;
           }
           fields.style.display = 'block';
+          connectToolbar.style.display = 'flex';
+          personalAction.style.display = 'none';
           deviceConnect.disabled = false;
           redirectConnect.setAttribute('href', '/auth/outlook/start');
           redirectConnect.removeAttribute('aria-disabled');
