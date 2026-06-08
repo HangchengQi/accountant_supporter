@@ -7,6 +7,7 @@ import os
 import secrets
 import time
 from dataclasses import replace
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -556,14 +557,21 @@ def upload_record_to_zoho(
         raise ValueError("invoice_number is required for Zoho upload")
     if extracted.amount is None:
         raise ValueError("amount is required for Zoho upload")
+    invoice_date = _zoho_date(extracted.invoice_date)
+    due_date = _zoho_date(extracted.due_date)
     account = _match_zoho_account(extracted)
     vendor = _find_or_create_zoho_vendor(org_id, extracted.vendor_name)
-    updated_extracted = replace(extracted, expense_account_id=account["account_id"])
+    updated_extracted = replace(
+        extracted,
+        invoice_date=invoice_date,
+        due_date=due_date,
+        expense_account_id=account["account_id"],
+    )
     bill_payload = {
         "vendor_id": str(vendor["contact_id"]),
         "bill_number": extracted.invoice_number,
-        "date": extracted.invoice_date,
-        "due_date": extracted.due_date,
+        "date": invoice_date,
+        "due_date": due_date,
         "notes": record.summary,
         "line_items": [
             {
@@ -606,6 +614,18 @@ def upload_record_to_zoho(
         },
         updated_extracted,
     )
+
+
+def _zoho_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = value.strip()
+    for date_format in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y"):
+        try:
+            return datetime.strptime(cleaned, date_format).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid invoice date format for Zoho Books: {value}")
 
 
 def _saved_files_from_payload(payload: dict[str, Any]) -> list[Path]:
