@@ -1,6 +1,6 @@
 import unittest
 
-from app.main import save_outlook_settings, storage
+from app.main import mail_poll_settings, save_mail_poll_settings, save_outlook_settings, storage
 from app.outlook import OutlookConfig, OutlookGraphClient
 
 
@@ -93,6 +93,23 @@ class OutlookConfigTest(unittest.TestCase):
                 storage.save_connector_settings("outlook", original)
             else:
                 storage.delete_connector_settings("outlook")
+
+    def test_save_mail_poll_settings_controls_auto_fetch_interval(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            status = save_mail_poll_settings({"interval_minutes": "15"})
+
+            self.assertEqual(status["interval_minutes"], 15)
+            self.assertTrue(status["enabled"])
+            self.assertTrue(mail_poll_settings()["saved_locally"])
+
+            capped = save_mail_poll_settings({"interval_minutes": "2000"})
+            self.assertEqual(capped["interval_minutes"], 1440)
+        finally:
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
 
 
 if __name__ == "__main__":

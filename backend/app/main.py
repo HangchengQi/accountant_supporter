@@ -391,6 +391,28 @@ def save_approval_settings(data: dict[str, Any]) -> dict[str, Any]:
     return approval_settings()
 
 
+def mail_poll_settings() -> dict[str, Any]:
+    settings = storage.get_connector_settings("mail_poll") or {}
+    interval = settings.get("interval_minutes", 0)
+    try:
+        interval = float(interval)
+    except (TypeError, ValueError):
+        interval = 0
+    interval = max(0.0, min(1440.0, interval))
+    return {
+        "interval_minutes": interval,
+        "enabled": interval > 0,
+        "saved_locally": bool(settings),
+    }
+
+
+def save_mail_poll_settings(data: dict[str, Any]) -> dict[str, Any]:
+    interval = float(data.get("interval_minutes", 0))
+    interval = max(0.0, min(1440.0, interval))
+    storage.save_connector_settings("mail_poll", {"interval_minutes": interval})
+    return mail_poll_settings()
+
+
 def save_log_settings(data: dict[str, Any]) -> dict[str, Any]:
     receiver_email = str(data.get("receiver_email", "")).strip()
     if receiver_email and ("@" not in receiver_email or len(receiver_email) > 320):
@@ -1382,7 +1404,15 @@ def processing_page() -> str:
               <button class="secondary" type="button" id="outlook-fetch">Fetch inbox into queue</button>
               <button class="secondary" type="button" id="queue-run">Run queue</button>
             </div>
+            <div class="poll-settings">
+              <div class="filter-field">
+                <label for="mail-poll-interval">Auto-fetch interval (minutes)</label>
+                <input id="mail-poll-interval" type="number" min="0" max="1440" step="0.25" placeholder="0 disables auto-fetch" />
+              </div>
+              <button class="secondary" type="button" id="mail-poll-save">Save auto-fetch</button>
+            </div>
             <div class="status" id="outlook-status">Checking status...</div>
+            <div class="status" id="mail-poll-status">Auto-fetch settings are loading.</div>
             <div class="notice" id="queue-status">Queue status will appear here.</div>
             <div id="outlook-messages"></div>
           </div>
@@ -1407,10 +1437,10 @@ def processing_page() -> str:
                 <option value="all">All history</option>
                 <option value="manual_review">Review required</option>
                 <option value="automated_submission">Automated submission</option>
-              <option value="manual_submission">Manual submission</option>
-              <option value="failed">Failed submission</option>
-              <option value="discarded">Discarded</option>
-            </select>
+                <option value="manual_submission">Manual submission</option>
+                <option value="failed">Failed submission</option>
+                <option value="discarded">Discarded</option>
+              </select>
             </div>
             <div class="filter-field">
               <label for="history-from-filter">From timestamp</label>
@@ -1430,6 +1460,9 @@ def processing_page() -> str:
       </main>
       <script>
         let outlookMessages = [];
+        let outlookConnected = false;
+        let mailPollTimer = null;
+        let mailPollRunning = false;
         const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
           '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
         }}[char]));
@@ -1439,17 +1472,19 @@ def processing_page() -> str:
           const status = await response.json();
           const target = document.getElementById('outlook-status');
           const pill = document.getElementById('outlook-pill');
+          outlookConnected = Boolean(status.connected);
           pill.textContent = status.connected ? 'Connected' : 'Not connected';
           pill.className = status.connected ? 'pill ok' : 'pill';
           target.textContent = status.connected ? 'Outlook is connected' : 'Connect Outlook on the Connections page first';
+          return status;
         }}
 
-        document.getElementById('outlook-fetch').addEventListener('click', async () => {{
+        async function fetchInboxIntoQueue() {{
           const response = await fetch('/api/outlook/messages?top=5');
           const result = await response.json();
           if (!response.ok) {{
             document.getElementById('outlook-messages').textContent = result.error || 'Unable to fetch messages';
-            return;
+            throw new Error(result.error || 'Unable to fetch messages');
           }}
           outlookMessages = result.messages || [];
           await refreshQueueStatus();
@@ -1461,9 +1496,10 @@ def processing_page() -> str:
               <span class="pill">Queued</span>
             </article>
           `).join('') || '<p>No messages found.</p>';
-        }});
+          return result;
+        }}
 
-        document.getElementById('queue-run').addEventListener('click', async () => {{
+        async function runQueue() {{
           const response = await fetch('/api/jobs/run', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
@@ -1472,13 +1508,95 @@ def processing_page() -> str:
           const result = await response.json();
           if (!response.ok) {{
             document.getElementById('queue-status').textContent = result.error || 'Unable to run queue';
-            return;
+            throw new Error(result.error || 'Unable to run queue');
           }}
           document.getElementById('queue-status').textContent =
             `Queue run: claimed ${{result.claimed}}, completed ${{result.completed}}, created processing jobs ${{result.created_processing_jobs}}, skipped ${{result.skipped_irrelevant}}.`;
           if (result.completed > 0) {{
             window.location.reload();
           }}
+          return result;
+        }}
+
+        document.getElementById('outlook-fetch').addEventListener('click', async () => {{
+          try {{
+            await fetchInboxIntoQueue();
+          }} catch (error) {{
+            document.getElementById('mail-poll-status').textContent = error.message;
+          }}
+        }});
+
+        document.getElementById('queue-run').addEventListener('click', async () => {{
+          try {{
+            await runQueue();
+          }} catch (error) {{
+            document.getElementById('mail-poll-status').textContent = error.message;
+          }}
+        }});
+
+        async function refreshMailPollSettings() {{
+          const response = await fetch('/api/mail-poll/settings');
+          const settings = await response.json();
+          document.getElementById('mail-poll-interval').value = settings.interval_minutes || 0;
+          configureMailPoll(settings.interval_minutes || 0);
+        }}
+
+        function configureMailPoll(intervalMinutes) {{
+          if (mailPollTimer) {{
+            clearInterval(mailPollTimer);
+            mailPollTimer = null;
+          }}
+          const status = document.getElementById('mail-poll-status');
+          const interval = Number(intervalMinutes || 0);
+          if (!interval) {{
+            status.textContent = 'Auto-fetch is disabled. Set a minute interval above 0 to enable it.';
+            return;
+          }}
+          if (!outlookConnected) {{
+            status.textContent = `Auto-fetch every ${{interval}} minute${{interval === 1 ? '' : 's'}} is saved and will start after Outlook connects.`;
+          }} else {{
+            status.textContent = `Auto-fetch is active every ${{interval}} minute${{interval === 1 ? '' : 's'}}.`;
+          }}
+          mailPollTimer = setInterval(runMailPollOnce, Math.max(15000, interval * 60 * 1000));
+        }}
+
+        async function runMailPollOnce() {{
+          if (mailPollRunning) {{
+            return;
+          }}
+          mailPollRunning = true;
+          const status = document.getElementById('mail-poll-status');
+          status.textContent = 'Auto-fetch running...';
+          try {{
+            const outlook = await outlookStatus();
+            if (!outlook.connected) {{
+              status.textContent = 'Auto-fetch is waiting for Outlook connection.';
+              return;
+            }}
+            const fetched = await fetchInboxIntoQueue();
+            const queued = await runQueue();
+            status.textContent =
+              `Auto-fetch complete: ingested ${{fetched.ingested || 0}}, completed ${{queued.completed || 0}} jobs.`;
+          }} catch (error) {{
+            status.textContent = error.message || 'Auto-fetch failed.';
+          }} finally {{
+            mailPollRunning = false;
+          }}
+        }}
+
+        document.getElementById('mail-poll-save').addEventListener('click', async () => {{
+          const interval = document.getElementById('mail-poll-interval').value;
+          const response = await fetch('/api/mail-poll/settings', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ interval_minutes: interval }})
+          }});
+          const result = await response.json();
+          if (!response.ok) {{
+            document.getElementById('mail-poll-status').textContent = result.error || 'Unable to save auto-fetch settings';
+            return;
+          }}
+          configureMailPoll(result.interval_minutes || 0);
         }});
 
         document.querySelector('.records').addEventListener('click', async (event) => {{
@@ -1581,7 +1699,7 @@ def processing_page() -> str:
             `Jobs: pending ${{counts.pending || 0}}, running ${{counts.running || 0}}, completed ${{counts.completed || 0}}, failed ${{counts.failed || 0}}.`;
         }}
 
-        outlookStatus();
+        outlookStatus().then(refreshMailPollSettings);
         refreshQueueStatus();
         applyHistoryFilters();
       </script>
@@ -1637,6 +1755,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/approval/settings":
             self._send_json(approval_settings())
             return
+        if path == "/api/mail-poll/settings":
+            self._send_json(mail_poll_settings())
+            return
         if path == "/api/outlook/messages":
             self._send_outlook_messages()
             return
@@ -1686,6 +1807,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/approval/settings":
             try:
                 self._send_json(save_approval_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/mail-poll/settings":
+            try:
+                self._send_json(save_mail_poll_settings(self._read_json()))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -2055,6 +2182,13 @@ def base_css() -> str:
       }
       button.secondary:hover { background: #e0e9ed; }
       .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+      .poll-settings {
+        display: grid;
+        grid-template-columns: minmax(190px, 260px) auto;
+        gap: 10px;
+        align-items: end;
+        margin: 10px 0;
+      }
       .approval-actions { margin-top: 14px; }
       .history-head {
         border-top: 1px solid var(--line);
@@ -2126,6 +2260,7 @@ def base_css() -> str:
       @media (max-width: 840px) {
         header { align-items: stretch; flex-direction: column; }
         main, .connection-main { grid-template-columns: 1fr; }
+        .poll-settings { grid-template-columns: 1fr; }
         .history-filters { grid-template-columns: 1fr; }
       }
     """
