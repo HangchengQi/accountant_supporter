@@ -1401,18 +1401,24 @@ Thank you.</textarea>
             <p>Completed approvals, automatic submissions, and reviewed items.</p>
           </div>
           <div class="history-filters">
-            <label for="history-status-filter">Status</label>
-            <select id="history-status-filter">
-              <option value="all">All history</option>
-              <option value="manual_review">Review required</option>
-              <option value="automated_submission">Automated submission</option>
-              <option value="manual_submission">Manual submission</option>
-              <option value="failed">Failed submission</option>
-            </select>
-            <label for="history-from-filter">From timestamp</label>
-            <input id="history-from-filter" type="datetime-local" />
-            <label for="history-to-filter">To timestamp</label>
-            <input id="history-to-filter" type="datetime-local" />
+            <div class="filter-field">
+              <label for="history-status-filter">Status</label>
+              <select id="history-status-filter">
+                <option value="all">All history</option>
+                <option value="manual_review">Review required</option>
+                <option value="automated_submission">Automated submission</option>
+                <option value="manual_submission">Manual submission</option>
+                <option value="failed">Failed submission</option>
+              </select>
+            </div>
+            <div class="filter-field">
+              <label for="history-from-filter">From timestamp</label>
+              <input id="history-from-filter" type="datetime-local" />
+            </div>
+            <div class="filter-field">
+              <label for="history-to-filter">To timestamp</label>
+              <input id="history-to-filter" type="datetime-local" />
+            </div>
           </div>
           <div class="toolbar">
             <button class="secondary" type="button" id="history-clear-filters">Clear filters</button>
@@ -2033,11 +2039,22 @@ def base_css() -> str:
       .history-head p { margin: 2px 0 0; font-size: 13px; }
       .history-filters {
         display: grid;
-        grid-template-columns: minmax(140px, 1fr) minmax(160px, 1fr) minmax(160px, 1fr);
-        gap: 10px 12px;
-        align-items: end;
+        grid-template-columns: minmax(180px, 1.1fr) minmax(190px, 1fr) minmax(190px, 1fr);
+        gap: 12px;
+        align-items: start;
+        margin-top: 10px;
       }
-      .history-filters label { margin-top: 10px; }
+      .filter-field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 0;
+      }
+      .filter-field label { margin: 0; }
+      .filter-field input,
+      .filter-field select {
+        min-height: 42px;
+      }
       .status { color: var(--muted); font-size: 13px; min-height: 20px; }
       .pill {
         display: inline-flex;
