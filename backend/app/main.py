@@ -806,8 +806,13 @@ def reject_processed_email(processed_email_id: int, suggested_account: str) -> d
     suggested_account = suggested_account.strip()
     if not suggested_account:
         raise ValueError("suggested_account is required")
-    if storage.get_processed_email(processed_email_id) is None:
+    record = storage.get_processed_email(processed_email_id)
+    if record is None:
         raise ValueError("processed email not found")
+    superseded_payload = dict(record.zoho_payload)
+    superseded_payload["superseded_by"] = "review_account"
+    superseded_payload["reviewer_suggestion"] = suggested_account
+    storage.update_processed_email_zoho(processed_email_id, "superseded", superseded_payload)
     job = storage.create_job(
         job_type=REVIEW_ACCOUNT,
         payload={
@@ -826,6 +831,18 @@ def reject_processed_email(processed_email_id: int, suggested_account: str) -> d
     return {"job": job.to_dict(), "queue_run": result.to_dict()}
 
 
+def discard_processed_email(processed_email_id: int, reason: str = "") -> dict[str, Any]:
+    record = storage.get_processed_email(processed_email_id)
+    if record is None:
+        raise ValueError("processed email not found")
+    payload = dict(record.zoho_payload)
+    payload["discard_reason"] = reason.strip() or "Discarded by user."
+    payload["discarded_at"] = datetime.now().isoformat()
+    storage.update_processed_email_zoho(record.id, "discarded", payload)
+    refreshed = storage.get_processed_email(record.id)
+    return refreshed.to_dict() if refreshed else record.to_dict()
+
+
 def process_account_review(payload: dict[str, Any]) -> ProcessedEmail:
     processed_id = int(payload["processed_email_id"])
     suggestion = str(payload["suggested_account"]).strip()
@@ -836,7 +853,7 @@ def process_account_review(payload: dict[str, Any]) -> ProcessedEmail:
     review_instruction = (
         "\n\n---\nReviewer account suggestion: "
         f"{suggestion}\n"
-        "Re-evaluate the expense/account line account. Prefer the reviewer suggestion only if it fits the invoice context and available Zoho account list. Return a fresh account confidence and reason."
+        "Highest priority instruction for expense/account line account: use the reviewer suggestion as the selected account when it matches an available Zoho account name or is clearly equivalent to one. Do not override it with your previous recommendation unless the suggestion is impossible to map to any available account. Return a fresh account confidence and reason that explains how the suggestion was applied."
     )
     email = EmailSampleIn(
         subject=record.subject,
@@ -1407,9 +1424,10 @@ Thank you.</textarea>
                 <option value="all">All history</option>
                 <option value="manual_review">Review required</option>
                 <option value="automated_submission">Automated submission</option>
-                <option value="manual_submission">Manual submission</option>
-                <option value="failed">Failed submission</option>
-              </select>
+              <option value="manual_submission">Manual submission</option>
+              <option value="failed">Failed submission</option>
+              <option value="discarded">Discarded</option>
+            </select>
             </div>
             <div class="filter-field">
               <label for="history-from-filter">From timestamp</label>
@@ -1498,10 +1516,11 @@ Thank you.</textarea>
         document.querySelector('.records').addEventListener('click', async (event) => {{
           const approveButton = event.target.closest('.approve-record');
           const rejectButton = event.target.closest('.reject-record');
-          if (!approveButton && !rejectButton) {{
+          const discardButton = event.target.closest('.discard-record');
+          if (!approveButton && !rejectButton && !discardButton) {{
             return;
           }}
-          const recordId = (approveButton || rejectButton).dataset.recordId;
+          const recordId = (approveButton || rejectButton || discardButton).dataset.recordId;
           const status = document.getElementById(`approval-status-${{recordId}}`);
           if (approveButton) {{
             status.textContent = 'Uploading to Zoho...';
@@ -1509,6 +1528,21 @@ Thank you.</textarea>
             const result = await response.json();
             if (!response.ok) {{
               status.textContent = result.error || 'Upload failed';
+              return;
+            }}
+            window.location.reload();
+            return;
+          }}
+          if (discardButton) {{
+            status.textContent = 'Discarding request...';
+            const response = await fetch(`/api/processed-emails/${{recordId}}/discard`, {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ reason: 'Discarded from Pending Approval.' }})
+            }});
+            const result = await response.json();
+            if (!response.ok) {{
+              status.textContent = result.error || 'Unable to discard request';
               return;
             }}
             window.location.reload();
@@ -1707,6 +1741,19 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
+        if path.startswith("/api/processed-emails/") and path.endswith("/discard"):
+            try:
+                processed_id = int(path.split("/")[3])
+                payload = self._read_json()
+                self._send_json(
+                    discard_processed_email(
+                        processed_id,
+                        str(payload.get("reason", "")),
+                    )
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/jobs/run":
             try:
                 payload = self._read_json()
@@ -1809,6 +1856,7 @@ def render_record(record: ProcessedEmail, section: str = "history") -> str:
             <div class="notice">{reason}</div>
             <div class="toolbar">
               <button type="button" class="approve-record" data-record-id="{record.id}">Approve and upload to Zoho</button>
+              <button type="button" class="discard-record secondary" data-record-id="{record.id}">Discard request</button>
             </div>
             <label for="suggested-account-{record.id}">Suggested expense/account line account</label>
             <input id="suggested-account-{record.id}" class="suggested-account" autocomplete="off" placeholder="Example: Repairs and Maintenance" />
@@ -1851,6 +1899,10 @@ def _approval_status_group(record: ProcessedEmail) -> str:
         return "automated_submission"
     if record.zoho_status == "upload_failed":
         return "failed"
+    if record.zoho_status == "discarded":
+        return "discarded"
+    if record.zoho_status == "superseded":
+        return "manual_review"
     if record.zoho_status == "pending_approval":
         return "manual_review"
     if record.extracted.needs_review:
@@ -1864,11 +1916,16 @@ def _approval_status_label(record: ProcessedEmail) -> str:
         "automated_submission": "Automated submission",
         "manual_submission": "Manual submission",
         "failed": "Failed submission",
+        "discarded": "Discarded",
     }
     if record.zoho_status == "pending_approval":
         return "Review required"
     if record.zoho_status == "upload_failed":
         return "Failed submission"
+    if record.zoho_status == "discarded":
+        return "Discarded"
+    if record.zoho_status == "superseded":
+        return "Superseded by reviewer suggestion"
     return labels.get(_approval_status_group(record), record.zoho_status.replace("_", " ").title())
 
 
