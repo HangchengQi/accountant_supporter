@@ -1346,7 +1346,10 @@ def index() -> str:
 
 def processing_page() -> str:
     records = storage.list_processed_emails()
-    record_items = "\n".join(render_record(record) for record in records)
+    pending_records = [record for record in records if record.zoho_status in {"pending_approval", "upload_failed"}]
+    history_records = [record for record in records if record.zoho_status not in {"pending_approval", "upload_failed"}]
+    pending_items = "\n".join(render_record(record, section="pending") for record in pending_records)
+    history_items = "\n".join(render_record(record, section="history") for record in history_records)
     body = f"""
       <main>
         <section>
@@ -1385,8 +1388,37 @@ Thank you.</textarea>
           </div>
         </section>
         <section class="records">
-          <h2>Recent Results</h2>
-          <div id="records">{record_items or "<p>No processed emails yet.</p>"}</div>
+          <div class="connector-head">
+            <div>
+              <h2>Pending Approval</h2>
+              <p>Invoices waiting for account review or upload approval.</p>
+            </div>
+            <span class="pill">{len(pending_records)} pending</span>
+          </div>
+          <div id="pending-records">{pending_items or "<p>No invoices are waiting for approval.</p>"}</div>
+          <div class="history-head">
+            <h2>Approval History</h2>
+            <p>Completed approvals, automatic submissions, and reviewed items.</p>
+          </div>
+          <div class="history-filters">
+            <label for="history-status-filter">Status</label>
+            <select id="history-status-filter">
+              <option value="all">All history</option>
+              <option value="manual_review">Review required</option>
+              <option value="automated_submission">Automated submission</option>
+              <option value="manual_submission">Manual submission</option>
+              <option value="failed">Failed submission</option>
+            </select>
+            <label for="history-from-filter">From timestamp</label>
+            <input id="history-from-filter" type="datetime-local" />
+            <label for="history-to-filter">To timestamp</label>
+            <input id="history-to-filter" type="datetime-local" />
+          </div>
+          <div class="toolbar">
+            <button class="secondary" type="button" id="history-clear-filters">Clear filters</button>
+          </div>
+          <div class="status" id="history-filter-status"></div>
+          <div id="history-records">{history_items or "<p>No approval history yet.</p>"}</div>
         </section>
       </main>
       <script>
@@ -1457,7 +1489,7 @@ Thank you.</textarea>
           }}
         }});
 
-        document.getElementById('records').addEventListener('click', async (event) => {{
+        document.querySelector('.records').addEventListener('click', async (event) => {{
           const approveButton = event.target.closest('.approve-record');
           const rejectButton = event.target.closest('.reject-record');
           if (!approveButton && !rejectButton) {{
@@ -1496,6 +1528,40 @@ Thank you.</textarea>
           window.location.reload();
         }});
 
+        function applyHistoryFilters() {{
+          const statusFilter = document.getElementById('history-status-filter').value;
+          const fromValue = document.getElementById('history-from-filter').value;
+          const toValue = document.getElementById('history-to-filter').value;
+          const fromTime = fromValue ? new Date(fromValue).getTime() : null;
+          const toTime = toValue ? new Date(toValue).getTime() : null;
+          let visible = 0;
+          document.querySelectorAll('#history-records article').forEach((article) => {{
+            const statusGroup = article.dataset.statusGroup || 'all';
+            const createdAt = new Date(article.dataset.createdAt || '').getTime();
+            const statusMatches = statusFilter === 'all' || statusFilter === statusGroup;
+            const fromMatches = !fromTime || (!Number.isNaN(createdAt) && createdAt >= fromTime);
+            const toMatches = !toTime || (!Number.isNaN(createdAt) && createdAt <= toTime);
+            const show = statusMatches && fromMatches && toMatches;
+            article.style.display = show ? '' : 'none';
+            if (show) {{
+              visible += 1;
+            }}
+          }});
+          document.getElementById('history-filter-status').textContent =
+            `${{visible}} history item${{visible === 1 ? '' : 's'}} shown.`;
+        }}
+
+        ['history-status-filter', 'history-from-filter', 'history-to-filter'].forEach((id) => {{
+          document.getElementById(id).addEventListener('change', applyHistoryFilters);
+        }});
+
+        document.getElementById('history-clear-filters').addEventListener('click', () => {{
+          document.getElementById('history-status-filter').value = 'all';
+          document.getElementById('history-from-filter').value = '';
+          document.getElementById('history-to-filter').value = '';
+          applyHistoryFilters();
+        }});
+
         async function refreshQueueStatus() {{
           const response = await fetch('/api/jobs/status');
           const status = await response.json();
@@ -1509,6 +1575,7 @@ Thank you.</textarea>
 
         outlookStatus();
         refreshQueueStatus();
+        applyHistoryFilters();
       </script>
     """
     return page_shell("Accountant Supporter Processing", body, active="processing")
@@ -1720,12 +1787,14 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def render_record(record: ProcessedEmail) -> str:
+def render_record(record: ProcessedEmail, section: str = "history") -> str:
     extracted = record.extracted
     review = '<span class="badge">Review required</span>' if extracted.needs_review else ""
     approval = '<span class="badge">Approval pending</span>' if record.zoho_status in {"pending_approval", "upload_failed"} else ""
     amount = "" if extracted.amount is None else f"{extracted.currency or ''} {extracted.amount:,.2f}"
     account_confidence = f"{extracted.account_confidence:.2f}"
+    status_group = _approval_status_group(record)
+    status_label = _approval_status_label(record)
     actions = ""
     if record.zoho_status in {"pending_approval", "upload_failed"}:
         reason = html.escape(str(record.zoho_payload.get("approval_reason") or record.zoho_payload.get("upload_error") or "Review required."))
@@ -1744,11 +1813,12 @@ def render_record(record: ProcessedEmail) -> str:
           </div>
         """
     return f"""
-      <article>
+      <article data-status-group="{html.escape(status_group)}" data-created-at="{html.escape(record.created_at.isoformat())}">
         <strong>{html.escape(record.subject)}</strong>
         {review}
         {approval}
-        <div class="meta">{html.escape(record.sender)} | workflow v{record.workflow_version} | {record.zoho_status}</div>
+        <div class="meta">{html.escape(record.sender)} | {html.escape(record.created_at.isoformat())} | workflow v{record.workflow_version}</div>
+        <div class="meta">Approval status: {html.escape(status_label)}</div>
         <p>{html.escape(record.summary)}</p>
         <dl>
           <dt>Category</dt><dd>{html.escape(extracted.category)}</dd>
@@ -1765,6 +1835,35 @@ def render_record(record: ProcessedEmail) -> str:
         {actions}
       </article>
     """
+
+
+def _approval_status_group(record: ProcessedEmail) -> str:
+    if record.zoho_status == "uploaded":
+        reason = str(record.zoho_payload.get("approval_reason", ""))
+        if reason or record.zoho_payload.get("reviewed_from_processed_email_id"):
+            return "manual_submission"
+        return "automated_submission"
+    if record.zoho_status == "upload_failed":
+        return "failed"
+    if record.zoho_status == "pending_approval":
+        return "manual_review"
+    if record.extracted.needs_review:
+        return "manual_review"
+    return "automated_submission"
+
+
+def _approval_status_label(record: ProcessedEmail) -> str:
+    labels = {
+        "manual_review": "Review required",
+        "automated_submission": "Automated submission",
+        "manual_submission": "Manual submission",
+        "failed": "Failed submission",
+    }
+    if record.zoho_status == "pending_approval":
+        return "Review required"
+    if record.zoho_status == "upload_failed":
+        return "Failed submission"
+    return labels.get(_approval_status_group(record), record.zoho_status.replace("_", " ").title())
 
 
 def auth_result_page(title: str, message: str, success: bool) -> str:
@@ -1926,6 +2025,19 @@ def base_css() -> str:
       button.secondary:hover { background: #e0e9ed; }
       .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
       .approval-actions { margin-top: 14px; }
+      .history-head {
+        border-top: 1px solid var(--line);
+        margin-top: 22px;
+        padding-top: 18px;
+      }
+      .history-head p { margin: 2px 0 0; font-size: 13px; }
+      .history-filters {
+        display: grid;
+        grid-template-columns: minmax(140px, 1fr) minmax(160px, 1fr) minmax(160px, 1fr);
+        gap: 10px 12px;
+        align-items: end;
+      }
+      .history-filters label { margin-top: 10px; }
       .status { color: var(--muted); font-size: 13px; min-height: 20px; }
       .pill {
         display: inline-flex;
@@ -1972,6 +2084,7 @@ def base_css() -> str:
       @media (max-width: 840px) {
         header { align-items: stretch; flex-direction: column; }
         main, .connection-main { grid-template-columns: 1fr; }
+        .history-filters { grid-template-columns: 1fr; }
       }
     """
 
