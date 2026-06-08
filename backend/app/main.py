@@ -1370,23 +1370,6 @@ def processing_page() -> str:
     body = f"""
       <main>
         <section>
-          <form id="email-form">
-            <h2>Process Email</h2>
-            <label for="subject">Subject</label>
-            <input id="subject" name="subject" value="Invoice INV-1042 from Northstar Office Supply" required />
-            <label for="sender">Sender</label>
-            <input id="sender" name="sender" value="Northstar Office Supply &lt;billing@example.com&gt;" required />
-            <label for="body">Email Body</label>
-            <textarea id="body" name="body" required>Hello,
-
-Please find invoice INV-1042 for office supplies.
-Invoice date: 05/20/2026
-Due date: 06/19/2026
-Amount due: $842.15
-
-Thank you.</textarea>
-            <button type="submit">Process Email</button>
-          </form>
           <div class="connector">
             <div class="connector-head">
               <div>
@@ -1450,21 +1433,6 @@ Thank you.</textarea>
         const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
           '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
         }}[char]));
-
-        document.getElementById('email-form').addEventListener('submit', async (event) => {{
-          event.preventDefault();
-          const payload = Object.fromEntries(new FormData(event.currentTarget).entries());
-          const response = await fetch('/api/email-samples/process', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify(payload)
-          }});
-          if (!response.ok) {{
-            alert('Processing failed');
-            return;
-          }}
-          window.location.reload();
-        }});
 
         async function outlookStatus() {{
           const response = await fetch('/api/outlook/status');
