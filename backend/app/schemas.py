@@ -86,13 +86,22 @@ class ExtractedFields:
     due_date: str | None = None
     amount: float | None = None
     currency: str | None = None
+    expense_account_name: str | None = None
+    expense_account_id: str | None = None
+    account_confidence: float = 0.0
+    account_reason: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
 
     @classmethod
     def from_json(cls, value: str) -> "ExtractedFields":
-        return cls(**json.loads(value))
+        data = json.loads(value)
+        data.setdefault("expense_account_name", None)
+        data.setdefault("expense_account_id", None)
+        data.setdefault("account_confidence", 0.0)
+        data.setdefault("account_reason", None)
+        return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

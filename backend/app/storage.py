@@ -186,6 +186,66 @@ class SQLiteStorage:
             ).fetchall()
         return [self._row_to_processed_email(row) for row in rows]
 
+    def get_processed_email(self, processed_email_id: int) -> ProcessedEmail | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, created_at, subject, sender, summary, extracted_json,
+                       workflow_name, workflow_version, zoho_status, zoho_payload_json
+                FROM processed_emails
+                WHERE id = ?
+                """,
+                (processed_email_id,),
+            ).fetchone()
+        return self._row_to_processed_email(row) if row else None
+
+    def get_processed_email_body(self, processed_email_id: int) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT body
+                FROM processed_emails
+                WHERE id = ?
+                """,
+                (processed_email_id,),
+            ).fetchone()
+        return str(row["body"]) if row else None
+
+    def update_processed_email_zoho(
+        self,
+        processed_email_id: int,
+        zoho_status: str,
+        zoho_payload: dict[str, Any],
+        extracted: ExtractedFields | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            if extracted is None:
+                conn.execute(
+                    """
+                    UPDATE processed_emails
+                    SET zoho_status = ?,
+                        zoho_payload_json = ?
+                    WHERE id = ?
+                    """,
+                    (zoho_status, json.dumps(zoho_payload), processed_email_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE processed_emails
+                    SET zoho_status = ?,
+                        zoho_payload_json = ?,
+                        extracted_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        zoho_status,
+                        json.dumps(zoho_payload),
+                        extracted.to_json(),
+                        processed_email_id,
+                    ),
+                )
+
     def save_oauth_token(self, provider: str, token: dict[str, Any]) -> None:
         now = datetime.now(UTC).isoformat()
         with self._connect() as conn:

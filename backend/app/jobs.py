@@ -10,6 +10,7 @@ from .storage import SQLiteStorage
 
 CLASSIFY_EMAIL = "classify_email"
 PROCESS_EMAIL = "process_email"
+REVIEW_ACCOUNT = "review_account"
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ def enqueue_mail_message(storage: SQLiteStorage, message: MailMessage) -> Job:
 def run_queue_once(
     storage: SQLiteStorage,
     process_email: Any,
+    review_account: Any | None = None,
     max_jobs: int = 10,
     ai_settings: dict[str, Any] | None = None,
 ) -> QueueRunResult:
@@ -60,7 +62,7 @@ def run_queue_once(
             break
         claimed += 1
         try:
-            outcome = _run_job(storage, job, process_email, ai_settings)
+            outcome = _run_job(storage, job, process_email, review_account, ai_settings)
             completed += 1
             created_processing_jobs += int(outcome.get("created_processing_job", False))
             skipped_irrelevant += int(outcome.get("skipped_irrelevant", False))
@@ -94,12 +96,21 @@ def _run_job(
     storage: SQLiteStorage,
     job: Job,
     process_email: Any,
+    review_account: Any | None,
     ai_settings: dict[str, Any] | None,
 ) -> dict[str, Any]:
     if job.job_type == CLASSIFY_EMAIL:
         return _classify_message(storage, job, ai_settings)
     if job.job_type == PROCESS_EMAIL:
         return _process_message(storage, job, process_email)
+    if job.job_type == REVIEW_ACCOUNT:
+        if review_account is None:
+            raise ValueError("review_account handler is not configured")
+        processed: ProcessedEmail = review_account(job.payload)
+        return {
+            "status": "reviewed",
+            "processed_email_id": processed.id,
+        }
     raise ValueError(f"unknown job type: {job.job_type}")
 
 

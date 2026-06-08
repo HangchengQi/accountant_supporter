@@ -27,7 +27,9 @@ class CapturingOpenAIProcessor(OpenAIProcessor):
             "output_text": (
                 '{"summary":"Captured","category":"invoice","vendor_name":null,'
                 '"invoice_number":null,"invoice_date":null,"due_date":null,'
-                '"amount":null,"currency":null,"confidence":0.75,"needs_review":true}'
+                '"amount":null,"currency":null,"confidence":0.75,"needs_review":true,'
+                '"expense_account_name":"Office Supplies","expense_account_id":null,'
+                '"account_confidence":0.7,"account_reason":"Test rationale"}'
             )
         }
 

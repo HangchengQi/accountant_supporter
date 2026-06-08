@@ -115,6 +115,10 @@ class OpenAIProcessor(AIProcessor):
             due_date=result["due_date"],
             amount=result["amount"],
             currency=result["currency"],
+            expense_account_name=result["expense_account_name"],
+            expense_account_id=result["expense_account_id"],
+            account_confidence=float(result["account_confidence"]),
+            account_reason=result["account_reason"],
             confidence=float(result["confidence"]),
             needs_review=(
                 bool(result["needs_review"])
@@ -169,6 +173,10 @@ class OpenAIProcessor(AIProcessor):
                 "currency",
                 "confidence",
                 "needs_review",
+                "expense_account_name",
+                "expense_account_id",
+                "account_confidence",
+                "account_reason",
             ],
             "properties": {
                 "summary": {"type": "string"},
@@ -190,6 +198,10 @@ class OpenAIProcessor(AIProcessor):
                 "currency": nullable_string,
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "needs_review": {"type": "boolean"},
+                "expense_account_name": nullable_string,
+                "expense_account_id": nullable_string,
+                "account_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "account_reason": nullable_string,
             },
         }
 
@@ -385,6 +397,10 @@ class LocalHeuristicProcessor(AIProcessor):
             due_date=due_date,
             amount=amount,
             currency="USD" if amount is not None else None,
+            expense_account_name=self._guess_expense_account(text),
+            expense_account_id=None,
+            account_confidence=0.45,
+            account_reason="Local heuristic fallback; review recommended.",
             confidence=confidence,
             needs_review=needs_review,
         )
@@ -432,6 +448,14 @@ class LocalHeuristicProcessor(AIProcessor):
     def _guess_vendor(self, sender: str) -> str | None:
         name = sender.split("<", 1)[0].strip().strip('"')
         return name or None
+
+    def _guess_expense_account(self, text: str) -> str:
+        lowered = text.lower()
+        if any(word in lowered for word in ["lumber", "material", "joist", "rafter", "home depot"]):
+            return "Supplies"
+        if any(word in lowered for word in ["office", "paper", "printer"]):
+            return "Office Supplies"
+        return "Uncategorized Expense"
 
     def _confidence(self, category: str, amount: float | None, invoice_number: str | None) -> float:
         score = 0.35

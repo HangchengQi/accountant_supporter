@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import html
 import json
+import mimetypes
 import os
 import secrets
 import time
+from dataclasses import replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from .ai import (
     DEFAULT_OPENAI_CLASSIFICATION_MODEL,
@@ -17,13 +23,16 @@ from .ai import (
     create_ai_processor,
 )
 from .billing import BillAttachment, save_billing_artifacts
-from .jobs import enqueue_mail_message, queue_status, run_queue_once
+from .jobs import REVIEW_ACCOUNT, enqueue_mail_message, queue_status, run_queue_once
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
 from .pdf_context import append_attachment_context, build_attachment_context
-from .schemas import EmailSampleIn, MailMessage, ProcessedEmail
+from .schemas import EmailSampleIn, ExtractedFields, MailMessage, ProcessedEmail
 from .storage import SQLiteStorage
 from .workflow import Workflow, load_workflow
 from .zoho import DryRunZohoBooksClient, ZohoConfig, ZohoOAuthClient
+
+
+ZOHO_BOOKS_API_ROOT = "https://www.zohoapis.com/books/v3"
 
 
 def get_database_path() -> str:
@@ -60,14 +69,11 @@ def active_workflow() -> Workflow:
 def process_email_sample(email: EmailSampleIn) -> ProcessedEmail:
     workflow = load_workflow(get_workflow_path())
     ai_processor = create_ai_processor(storage.get_connector_settings("ai"))
-    ai_result = ai_processor.process(email, workflow)
-    zoho_status, zoho_payload = zoho_client.create_draft_from_email(
-        email,
-        ai_result.extracted,
-        workflow,
-    )
+    ai_email = _email_with_account_context(email)
+    ai_result = ai_processor.process(ai_email, workflow)
+    zoho_status, zoho_payload = _initial_zoho_state(ai_result.extracted)
     return storage.save_processed_email(
-        email=email,
+        email=ai_email,
         summary=ai_result.summary,
         extracted=ai_result.extracted,
         workflow=workflow,
@@ -84,7 +90,8 @@ def process_mail_message(message: MailMessage) -> ProcessedEmail:
         email = _email_with_attachment_context(email, attachments)
     record = process_email_sample(email)
     if message.provider == "outlook":
-        _handle_outlook_billing_artifacts(message, record, attachments)
+        artifacts = _handle_outlook_billing_artifacts(message, record, attachments)
+        record = _finalize_processed_email(record, artifacts.saved_files)
     return record
 
 
@@ -112,7 +119,7 @@ def _handle_outlook_billing_artifacts(
     message: MailMessage,
     record: ProcessedEmail,
     attachments: list[BillAttachment],
-) -> None:
+) -> Any:
     token = get_outlook_token()
     client = get_outlook_client()
     artifacts = save_billing_artifacts(
@@ -135,6 +142,53 @@ def _handle_outlook_billing_artifacts(
         except Exception as exc:
             with artifacts.daily_log.open("a", encoding="utf-8") as f:
                 f.write(f"- Log email send failed: {exc}\n\n")
+    return artifacts
+
+
+def _email_with_account_context(email: EmailSampleIn) -> EmailSampleIn:
+    context = build_zoho_account_context()
+    if not context:
+        return email
+    body = f"{email.body}\n\n---\n{context}"
+    return EmailSampleIn(subject=email.subject, sender=email.sender, body=body)
+
+
+def _initial_zoho_state(extracted: ExtractedFields) -> tuple[str, dict[str, Any]]:
+    settings = approval_settings()
+    return (
+        "pending_approval",
+        {
+            "approval_reason": _approval_reason(extracted, settings),
+            "approval_settings": settings,
+            "saved_files": [],
+        },
+    )
+
+
+def _finalize_processed_email(record: ProcessedEmail, saved_files: list[Path]) -> ProcessedEmail:
+    payload = dict(record.zoho_payload)
+    payload["saved_files"] = [str(path) for path in saved_files]
+    settings = approval_settings()
+    if _should_auto_upload(record.extracted, settings):
+        try:
+            uploaded_payload, updated_extracted = upload_record_to_zoho(record, saved_files)
+            storage.update_processed_email_zoho(
+                record.id,
+                "uploaded",
+                uploaded_payload,
+                updated_extracted,
+            )
+            refreshed = storage.get_processed_email(record.id)
+            return refreshed or record
+        except Exception as exc:
+            payload["upload_error"] = str(exc)
+            storage.update_processed_email_zoho(record.id, "upload_failed", payload)
+            refreshed = storage.get_processed_email(record.id)
+            return refreshed or record
+    payload["approval_reason"] = _approval_reason(record.extracted, settings)
+    storage.update_processed_email_zoho(record.id, "pending_approval", payload)
+    refreshed = storage.get_processed_email(record.id)
+    return refreshed or record
 
 
 def list_processed_emails() -> list[ProcessedEmail]:
@@ -307,12 +361,286 @@ def log_settings() -> dict[str, Any]:
     }
 
 
+def approval_settings() -> dict[str, Any]:
+    settings = storage.get_connector_settings("approval") or {}
+    threshold = settings.get("account_confidence_threshold", 0.85)
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        threshold = 0.85
+    threshold = max(0.0, min(1.0, threshold))
+    return {
+        "account_confidence_threshold": threshold,
+        "manual_approval_required": bool(settings.get("manual_approval_required", False)),
+        "saved_locally": bool(settings),
+    }
+
+
+def save_approval_settings(data: dict[str, Any]) -> dict[str, Any]:
+    threshold = float(data.get("account_confidence_threshold", 0.85))
+    threshold = max(0.0, min(1.0, threshold))
+    manual = bool(data.get("manual_approval_required", False))
+    storage.save_connector_settings(
+        "approval",
+        {
+            "account_confidence_threshold": threshold,
+            "manual_approval_required": manual,
+        },
+    )
+    return approval_settings()
+
+
 def save_log_settings(data: dict[str, Any]) -> dict[str, Any]:
     receiver_email = str(data.get("receiver_email", "")).strip()
     if receiver_email and ("@" not in receiver_email or len(receiver_email) > 320):
         raise ValueError("receiver_email must be a valid email address")
     storage.save_connector_settings("billing_log", {"receiver_email": receiver_email})
     return log_settings()
+
+
+def _should_auto_upload(extracted: ExtractedFields, settings: dict[str, Any]) -> bool:
+    if settings["manual_approval_required"]:
+        return False
+    if not extracted.expense_account_name:
+        return False
+    if not extracted.vendor_name or not extracted.invoice_number or extracted.amount is None:
+        return False
+    return extracted.account_confidence >= settings["account_confidence_threshold"]
+
+
+def _approval_reason(extracted: ExtractedFields, settings: dict[str, Any]) -> str:
+    if settings["manual_approval_required"]:
+        return "Manual approval is required by settings."
+    if not extracted.expense_account_name:
+        return "AI did not select an expense/account line account."
+    if not extracted.vendor_name or not extracted.invoice_number or extracted.amount is None:
+        return "Vendor, invoice number, or amount is missing."
+    if extracted.account_confidence < settings["account_confidence_threshold"]:
+        return (
+            f"Account confidence {extracted.account_confidence:.2f} is below "
+            f"threshold {settings['account_confidence_threshold']:.2f}."
+        )
+    return "Ready for automatic upload."
+
+
+def get_zoho_token() -> dict[str, Any]:
+    token = storage.get_oauth_token("zoho")
+    if not token:
+        raise ValueError("Zoho Books is not connected")
+    if float(token.get("expires_at", 0)) <= time.time() + 60:
+        token = get_zoho_oauth_client().refresh_token(token)
+        storage.save_oauth_token("zoho", token)
+    return token
+
+
+def _zoho_request(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    query: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    token = get_zoho_token()
+    url = f"{ZOHO_BOOKS_API_ROOT}{path}"
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Authorization": f"Zoho-oauthtoken {token['access_token']}"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=45) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        raise ValueError(f"Zoho Books request failed: HTTP {exc.code} {body}") from exc
+
+
+def zoho_organization() -> dict[str, Any]:
+    response = _zoho_request("GET", "/organizations")
+    organizations = response.get("organizations", [])
+    if not organizations:
+        raise ValueError("Zoho Books has no organization")
+    return next((org for org in organizations if org.get("is_default_org")), organizations[0])
+
+
+def zoho_expense_accounts() -> list[dict[str, Any]]:
+    org_id = str(zoho_organization()["organization_id"])
+    response = _zoho_request("GET", "/chartofaccounts", query={"organization_id": org_id})
+    accounts = response.get("chartofaccounts") or response.get("accounts") or []
+    result = []
+    for account in accounts:
+        name = str(account.get("account_name") or account.get("name") or "").strip()
+        account_type = str(account.get("account_type") or "").lower()
+        if account.get("is_active") is False or not name:
+            continue
+        if "expense" in account_type or "cost_of_goods_sold" in account_type or "expense" in name.lower():
+            result.append(
+                {
+                    "account_id": str(account.get("account_id", "")),
+                    "account_name": name,
+                    "account_type": account.get("account_type", ""),
+                }
+            )
+    return result
+
+
+def build_zoho_account_context() -> str:
+    if not storage.get_oauth_token("zoho"):
+        return ""
+    try:
+        accounts = zoho_expense_accounts()
+    except Exception:
+        return ""
+    if not accounts:
+        return ""
+    lines = [
+        "Available Zoho Books expense/account line accounts. Choose exactly one account_name when possible:"
+    ]
+    for account in accounts[:80]:
+        lines.append(
+            f"- {account['account_name']} | account_id={account['account_id']} | type={account['account_type']}"
+        )
+    return "\n".join(lines)
+
+
+def _match_zoho_account(extracted: ExtractedFields) -> dict[str, Any]:
+    accounts = zoho_expense_accounts()
+    wanted = (extracted.expense_account_name or "").strip().lower()
+    for account in accounts:
+        if account["account_name"].strip().lower() == wanted:
+            return account
+    for account in accounts:
+        if wanted and wanted in account["account_name"].strip().lower():
+            return account
+    raise ValueError(f"Zoho account not found: {extracted.expense_account_name or 'missing'}")
+
+
+def _find_or_create_zoho_vendor(org_id: str, vendor_name: str) -> dict[str, Any]:
+    response = _zoho_request(
+        "GET",
+        "/contacts",
+        query={
+            "organization_id": org_id,
+            "contact_type": "vendor",
+            "contact_name_contains": vendor_name[:100],
+        },
+    )
+    for contact in response.get("contacts", []):
+        if str(contact.get("contact_name", "")).strip().lower() == vendor_name.strip().lower():
+            return contact
+    created = _zoho_request(
+        "POST",
+        "/contacts",
+        payload={
+            "contact_name": vendor_name,
+            "company_name": vendor_name,
+            "contact_type": "vendor",
+            "notes": "Created by Accountant Supporter local MVP from invoice email processing.",
+        },
+        query={"organization_id": org_id},
+    )
+    return created["contact"]
+
+
+def upload_record_to_zoho(
+    record: ProcessedEmail,
+    saved_files: list[Path] | None = None,
+) -> tuple[dict[str, Any], ExtractedFields]:
+    org = zoho_organization()
+    org_id = str(org["organization_id"])
+    extracted = record.extracted
+    if not extracted.vendor_name:
+        raise ValueError("vendor_name is required for Zoho upload")
+    if not extracted.invoice_number:
+        raise ValueError("invoice_number is required for Zoho upload")
+    if extracted.amount is None:
+        raise ValueError("amount is required for Zoho upload")
+    account = _match_zoho_account(extracted)
+    vendor = _find_or_create_zoho_vendor(org_id, extracted.vendor_name)
+    updated_extracted = replace(extracted, expense_account_id=account["account_id"])
+    bill_payload = {
+        "vendor_id": str(vendor["contact_id"]),
+        "bill_number": extracted.invoice_number,
+        "date": extracted.invoice_date,
+        "due_date": extracted.due_date,
+        "notes": record.summary,
+        "line_items": [
+            {
+                "description": f"Imported invoice {extracted.invoice_number} from {extracted.vendor_name}",
+                "account_id": account["account_id"],
+                "rate": extracted.amount,
+                "quantity": 1,
+            }
+        ],
+    }
+    bill_response = _zoho_request(
+        "POST",
+        "/bills",
+        payload=bill_payload,
+        query={"organization_id": org_id},
+    )
+    bill = bill_response.get("bill", {})
+    bill_id = str(bill.get("bill_id", ""))
+    if not bill_id:
+        raise ValueError(f"Zoho did not return bill_id: {bill_response}")
+    attachments = []
+    for path in saved_files or _saved_files_from_payload(record.zoho_payload):
+        attachments.append(_upload_zoho_bill_attachment(org_id, bill_id, path))
+    return (
+        {
+            "organization": {"organization_id": org_id, "name": org.get("name")},
+            "vendor": {
+                "contact_id": vendor.get("contact_id"),
+                "contact_name": vendor.get("contact_name"),
+            },
+            "account": account,
+            "bill": {
+                "bill_id": bill_id,
+                "bill_number": bill.get("bill_number"),
+                "status": bill.get("status"),
+                "total": bill.get("total"),
+            },
+            "attachments": attachments,
+            "saved_files": [str(path) for path in (saved_files or _saved_files_from_payload(record.zoho_payload))],
+        },
+        updated_extracted,
+    )
+
+
+def _saved_files_from_payload(payload: dict[str, Any]) -> list[Path]:
+    return [Path(path) for path in payload.get("saved_files", []) if path]
+
+
+def _upload_zoho_bill_attachment(org_id: str, bill_id: str, path: Path) -> dict[str, Any]:
+    token = get_zoho_token()
+    boundary = f"----accountant-supporter-{uuid4().hex}"
+    file_bytes = path.read_bytes()
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    body = b"".join(
+        [
+            f"--{boundary}\r\n".encode("utf-8"),
+            f'Content-Disposition: form-data; name="attachment"; filename="{path.name}"\r\n'.encode("utf-8"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+            file_bytes,
+            f"\r\n--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+    request = Request(
+        f"{ZOHO_BOOKS_API_ROOT}/bills/{bill_id}/attachment?{urlencode({'organization_id': org_id})}",
+        data=body,
+        headers={
+            "Authorization": f"Zoho-oauthtoken {token['access_token']}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=45) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body_text = exc.read().decode("utf-8")
+        raise ValueError(f"Zoho attachment upload failed: HTTP {exc.code} {body_text}") from exc
 
 
 def start_outlook_redirect_auth() -> str:
@@ -438,9 +766,75 @@ def run_jobs(max_jobs: int = 10) -> dict[str, Any]:
     return run_queue_once(
         storage,
         process_mail_message,
+        process_account_review,
         max_jobs=max_jobs,
         ai_settings=storage.get_connector_settings("ai"),
     ).to_dict()
+
+
+def approve_processed_email(processed_email_id: int) -> dict[str, Any]:
+    record = storage.get_processed_email(processed_email_id)
+    if record is None:
+        raise ValueError("processed email not found")
+    payload, extracted = upload_record_to_zoho(record)
+    storage.update_processed_email_zoho(record.id, "uploaded", payload, extracted)
+    refreshed = storage.get_processed_email(record.id)
+    return refreshed.to_dict() if refreshed else record.to_dict()
+
+
+def reject_processed_email(processed_email_id: int, suggested_account: str) -> dict[str, Any]:
+    suggested_account = suggested_account.strip()
+    if not suggested_account:
+        raise ValueError("suggested_account is required")
+    if storage.get_processed_email(processed_email_id) is None:
+        raise ValueError("processed email not found")
+    job = storage.create_job(
+        job_type=REVIEW_ACCOUNT,
+        payload={
+            "processed_email_id": processed_email_id,
+            "suggested_account": suggested_account,
+        },
+        priority=30,
+    )
+    result = run_queue_once(
+        storage,
+        process_mail_message,
+        process_account_review,
+        max_jobs=1,
+        ai_settings=storage.get_connector_settings("ai"),
+    )
+    return {"job": job.to_dict(), "queue_run": result.to_dict()}
+
+
+def process_account_review(payload: dict[str, Any]) -> ProcessedEmail:
+    processed_id = int(payload["processed_email_id"])
+    suggestion = str(payload["suggested_account"]).strip()
+    record = storage.get_processed_email(processed_id)
+    body = storage.get_processed_email_body(processed_id)
+    if record is None or body is None:
+        raise ValueError("processed email not found")
+    review_instruction = (
+        "\n\n---\nReviewer account suggestion: "
+        f"{suggestion}\n"
+        "Re-evaluate the expense/account line account. Prefer the reviewer suggestion only if it fits the invoice context and available Zoho account list. Return a fresh account confidence and reason."
+    )
+    email = EmailSampleIn(
+        subject=record.subject,
+        sender=record.sender,
+        body=f"{body}{review_instruction}",
+    )
+    new_record = process_email_sample(email)
+    payload_update = dict(new_record.zoho_payload)
+    payload_update["reviewed_from_processed_email_id"] = processed_id
+    payload_update["reviewer_suggestion"] = suggestion
+    payload_update["saved_files"] = list(record.zoho_payload.get("saved_files", []))
+    storage.update_processed_email_zoho(new_record.id, new_record.zoho_status, payload_update)
+    refreshed = storage.get_processed_email(new_record.id)
+    if refreshed and _should_auto_upload(refreshed.extracted, approval_settings()):
+        payload_uploaded, extracted = upload_record_to_zoho(refreshed)
+        storage.update_processed_email_zoho(refreshed.id, "uploaded", payload_uploaded, extracted)
+        return storage.get_processed_email(refreshed.id) or refreshed
+    return refreshed or new_record
 
 
 def page_shell(title: str, body: str, active: str = "") -> str:
@@ -578,10 +972,30 @@ def index() -> str:
           </div>
           <div class="status" id="log-status">Daily billing log receiver is not set.</div>
         </section>
+
+        <section class="connection-card">
+          <div class="connector-head">
+            <div>
+              <h2>Approval Rules</h2>
+              <p>Control when AI-selected Zoho expense accounts can auto-upload.</p>
+            </div>
+            <span class="pill" id="approval-pill">Checking</span>
+          </div>
+          <label for="account-threshold">Account Confidence Threshold</label>
+          <input id="account-threshold" type="number" min="0" max="1" step="0.01" />
+          <label class="checkbox-row" for="manual-approval">
+            <input id="manual-approval" type="checkbox" />
+            Require manual approval for every invoice
+          </label>
+          <div class="toolbar">
+            <button class="secondary" type="button" id="approval-save">Save approval rules</button>
+          </div>
+          <div class="status" id="approval-status">Approval rules are loading.</div>
+        </section>
       </main>
       <script>
         async function refreshConnectionStatus() {
-          await Promise.all([refreshOutlookStatus(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings()]);
+          await Promise.all([refreshOutlookStatus(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshApprovalSettings()]);
         }
 
         async function refreshOutlookStatus() {
@@ -873,6 +1287,37 @@ def index() -> str:
           await refreshLogSettings();
         });
 
+        async function refreshApprovalSettings() {
+          const response = await fetch('/api/approval/settings');
+          const settings = await response.json();
+          document.getElementById('account-threshold').value = settings.account_confidence_threshold ?? 0.85;
+          document.getElementById('manual-approval').checked = Boolean(settings.manual_approval_required);
+          const pill = document.getElementById('approval-pill');
+          const status = document.getElementById('approval-status');
+          pill.textContent = settings.manual_approval_required ? 'Manual' : 'Auto when confident';
+          pill.className = settings.manual_approval_required ? 'pill' : 'pill ok';
+          status.textContent = settings.manual_approval_required
+            ? 'Every processed invoice will wait for approval.'
+            : `Invoices auto-upload when account confidence is at least ${Number(settings.account_confidence_threshold || 0).toFixed(2)}.`;
+        }
+
+        document.getElementById('approval-save').addEventListener('click', async () => {
+          const response = await fetch('/api/approval/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              account_confidence_threshold: document.getElementById('account-threshold').value,
+              manual_approval_required: document.getElementById('manual-approval').checked
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            document.getElementById('approval-status').textContent = result.error || 'Unable to save approval rules';
+            return;
+          }
+          await refreshApprovalSettings();
+        });
+
         refreshConnectionStatus();
       </script>
     """
@@ -992,6 +1437,45 @@ Thank you.</textarea>
           }}
         }});
 
+        document.getElementById('records').addEventListener('click', async (event) => {{
+          const approveButton = event.target.closest('.approve-record');
+          const rejectButton = event.target.closest('.reject-record');
+          if (!approveButton && !rejectButton) {{
+            return;
+          }}
+          const recordId = (approveButton || rejectButton).dataset.recordId;
+          const status = document.getElementById(`approval-status-${{recordId}}`);
+          if (approveButton) {{
+            status.textContent = 'Uploading to Zoho...';
+            const response = await fetch(`/api/processed-emails/${{recordId}}/approve`, {{ method: 'POST' }});
+            const result = await response.json();
+            if (!response.ok) {{
+              status.textContent = result.error || 'Upload failed';
+              return;
+            }}
+            window.location.reload();
+            return;
+          }}
+          const input = document.getElementById(`suggested-account-${{recordId}}`);
+          const suggestion = input.value.trim();
+          if (!suggestion) {{
+            status.textContent = 'Enter an expense/account line account suggestion first.';
+            return;
+          }}
+          status.textContent = 'Re-running account classification...';
+          const response = await fetch(`/api/processed-emails/${{recordId}}/reject`, {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ suggested_account: suggestion }})
+          }});
+          const result = await response.json();
+          if (!response.ok) {{
+            status.textContent = result.error || 'Unable to re-run classification';
+            return;
+          }}
+          window.location.reload();
+        }});
+
         async function refreshQueueStatus() {{
           const response = await fetch('/api/jobs/status');
           const status = await response.json();
@@ -1055,6 +1539,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/log/settings":
             self._send_json(log_settings())
             return
+        if path == "/api/approval/settings":
+            self._send_json(approval_settings())
+            return
         if path == "/api/outlook/messages":
             self._send_outlook_messages()
             return
@@ -1098,6 +1585,32 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/log/settings":
             try:
                 self._send_json(save_log_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/approval/settings":
+            try:
+                self._send_json(save_approval_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path.startswith("/api/processed-emails/") and path.endswith("/approve"):
+            try:
+                processed_id = int(path.split("/")[3])
+                self._send_json(approve_processed_email(processed_id))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path.startswith("/api/processed-emails/") and path.endswith("/reject"):
+            try:
+                processed_id = int(path.split("/")[3])
+                payload = self._read_json()
+                self._send_json(
+                    reject_processed_email(
+                        processed_id,
+                        str(payload.get("suggested_account", "")),
+                    )
+                )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -1190,11 +1703,31 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
 def render_record(record: ProcessedEmail) -> str:
     extracted = record.extracted
     review = '<span class="badge">Review required</span>' if extracted.needs_review else ""
+    approval = '<span class="badge">Approval pending</span>' if record.zoho_status in {"pending_approval", "upload_failed"} else ""
     amount = "" if extracted.amount is None else f"{extracted.currency or ''} {extracted.amount:,.2f}"
+    account_confidence = f"{extracted.account_confidence:.2f}"
+    actions = ""
+    if record.zoho_status in {"pending_approval", "upload_failed"}:
+        reason = html.escape(str(record.zoho_payload.get("approval_reason") or record.zoho_payload.get("upload_error") or "Review required."))
+        actions = f"""
+          <div class="approval-actions" data-record-id="{record.id}">
+            <div class="notice">{reason}</div>
+            <div class="toolbar">
+              <button type="button" class="approve-record" data-record-id="{record.id}">Approve and upload to Zoho</button>
+            </div>
+            <label for="suggested-account-{record.id}">Suggested expense/account line account</label>
+            <input id="suggested-account-{record.id}" class="suggested-account" autocomplete="off" placeholder="Example: Repairs and Maintenance" />
+            <div class="toolbar">
+              <button type="button" class="reject-record secondary" data-record-id="{record.id}">No, re-run with suggestion</button>
+            </div>
+            <div class="status" id="approval-status-{record.id}"></div>
+          </div>
+        """
     return f"""
       <article>
         <strong>{html.escape(record.subject)}</strong>
         {review}
+        {approval}
         <div class="meta">{html.escape(record.sender)} | workflow v{record.workflow_version} | {record.zoho_status}</div>
         <p>{html.escape(record.summary)}</p>
         <dl>
@@ -1205,7 +1738,11 @@ def render_record(record: ProcessedEmail) -> str:
           <dt>Due date</dt><dd>{html.escape(extracted.due_date or "")}</dd>
           <dt>Amount</dt><dd>{html.escape(amount)}</dd>
           <dt>Confidence</dt><dd>{extracted.confidence:.2f}</dd>
+          <dt>Account</dt><dd>{html.escape(extracted.expense_account_name or "")}</dd>
+          <dt>Account confidence</dt><dd>{html.escape(account_confidence)}</dd>
+          <dt>Account reason</dt><dd>{html.escape(extracted.account_reason or "")}</dd>
         </dl>
+        {actions}
       </article>
     """
 
@@ -1324,6 +1861,12 @@ def base_css() -> str:
         font-weight: 650;
         font-size: 14px;
       }
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .checkbox-row input { width: auto; }
       input, select, textarea {
         width: 100%;
         border: 1px solid #bdc9d1;
@@ -1362,6 +1905,7 @@ def base_css() -> str:
       }
       button.secondary:hover { background: #e0e9ed; }
       .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+      .approval-actions { margin-top: 14px; }
       .status { color: var(--muted); font-size: 13px; min-height: 20px; }
       .pill {
         display: inline-flex;
