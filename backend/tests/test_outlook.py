@@ -9,6 +9,8 @@ from app.main import (
     run_mail_poll_worker_once,
     save_mail_poll_settings,
     save_outlook_settings,
+    start_mail_poll_worker,
+    stop_mail_poll_worker,
     storage,
     update_mail_fetch_cursor,
 )
@@ -166,12 +168,33 @@ class OutlookConfigTest(unittest.TestCase):
             status = save_mail_poll_settings({"interval_minutes": "15"})
 
             self.assertEqual(status["interval_minutes"], 15)
-            self.assertTrue(status["enabled"])
+            self.assertFalse(status["enabled"])
+            self.assertEqual(status["health_status"], "stopped")
             self.assertTrue(mail_poll_settings()["saved_locally"])
 
             capped = save_mail_poll_settings({"interval_minutes": "2000"})
             self.assertEqual(capped["interval_minutes"], 1440)
         finally:
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
+
+    def test_mail_poll_worker_start_and_stop_controls_lifecycle(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            save_mail_poll_settings({"interval_minutes": "5"})
+            started = start_mail_poll_worker()
+
+            self.assertTrue(started["enabled"])
+            self.assertTrue(started["worker_alive"])
+
+            stopped = stop_mail_poll_worker()
+            self.assertFalse(stopped["enabled"])
+            self.assertFalse(stopped["worker_alive"])
+            self.assertEqual(stopped["health_status"], "stopped")
+        finally:
+            stop_mail_poll_worker()
             if original is not None:
                 storage.save_connector_settings("mail_poll", original)
             else:
@@ -199,7 +222,7 @@ class OutlookConfigTest(unittest.TestCase):
             with patch("app.main.get_outlook_token", side_effect=ValueError("Outlook is not connected")):
                 result = run_mail_poll_worker_once()
 
-            settings = mail_poll_settings()
+            settings = storage.get_connector_settings("mail_poll") or {}
             self.assertEqual(result["status"], "waiting_for_outlook")
             self.assertEqual(settings["last_worker_status"], "waiting_for_outlook")
             self.assertIn("Outlook is not connected", settings["last_worker_error"])

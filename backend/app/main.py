@@ -58,6 +58,8 @@ def get_logs_root() -> str:
 
 storage = SQLiteStorage(get_database_path())
 mail_poll_worker_lock = threading.Lock()
+mail_poll_worker_thread: MailPollWorker | None = None
+mail_poll_stop_event: threading.Event | None = None
 zoho_client = DryRunZohoBooksClient()
 pending_outlook_auth: DeviceCodeSession | None = None
 pending_outlook_state: str | None = None
@@ -396,6 +398,10 @@ def save_approval_settings(data: dict[str, Any]) -> dict[str, Any]:
     return approval_settings()
 
 
+def is_mail_poll_worker_alive() -> bool:
+    return mail_poll_worker_thread is not None and mail_poll_worker_thread.is_alive()
+
+
 def mail_poll_settings() -> dict[str, Any]:
     settings = storage.get_connector_settings("mail_poll") or {}
     interval = settings.get("interval_minutes", 0)
@@ -404,10 +410,29 @@ def mail_poll_settings() -> dict[str, Any]:
     except (TypeError, ValueError):
         interval = 0
     interval = max(0.0, min(1440.0, interval))
-    worker_status = "disabled" if interval <= 0 else settings.get("last_worker_status", "waiting")
+    worker_enabled = bool(settings.get("worker_enabled", False)) and interval > 0
+    worker_alive = is_mail_poll_worker_alive()
+    worker_status = settings.get("last_worker_status", "stopped")
+    if interval <= 0:
+        worker_status = "disabled"
+    elif not worker_enabled:
+        worker_status = "stopped"
+    elif not worker_alive and worker_status not in {"failed", "waiting_for_outlook"}:
+        worker_status = "stopped"
+    health_status = "disabled"
+    if worker_enabled and worker_alive and worker_status in {"success", "waiting", "starting"}:
+        health_status = "healthy"
+    elif worker_enabled and worker_alive and worker_status == "waiting_for_outlook":
+        health_status = "degraded"
+    elif interval > 0 and not worker_enabled:
+        health_status = "stopped"
+    elif worker_status == "failed" or (worker_enabled and not worker_alive):
+        health_status = "unhealthy"
     return {
         "interval_minutes": interval,
-        "enabled": interval > 0,
+        "enabled": worker_enabled,
+        "worker_alive": worker_alive,
+        "health_status": health_status,
         "last_successful_fetch_at": settings.get("last_successful_fetch_at"),
         "last_worker_attempt_at": settings.get("last_worker_attempt_at"),
         "last_worker_status": worker_status,
@@ -423,6 +448,10 @@ def save_mail_poll_settings(data: dict[str, Any]) -> dict[str, Any]:
     interval = float(data.get("interval_minutes", 0))
     interval = max(0.0, min(1440.0, interval))
     settings["interval_minutes"] = interval
+    if interval <= 0:
+        settings["worker_enabled"] = False
+        settings["last_worker_status"] = "disabled"
+        settings["last_worker_error"] = ""
     storage.save_connector_settings("mail_poll", settings)
     return mail_poll_settings()
 
@@ -937,6 +966,56 @@ class MailPollWorker(threading.Thread):
 
             run_mail_poll_worker_once()
             self.next_run_at = time.time() + max(15.0, interval_minutes * 60)
+
+
+def start_mail_poll_worker() -> dict[str, Any]:
+    global mail_poll_stop_event, mail_poll_worker_thread
+    settings = storage.get_connector_settings("mail_poll") or {}
+    interval = float(settings.get("interval_minutes", 0) or 0)
+    if interval <= 0:
+        settings["worker_enabled"] = False
+        settings["last_worker_status"] = "disabled"
+        settings["last_worker_error"] = "Set an auto-fetch interval above 0 before starting."
+        storage.save_connector_settings("mail_poll", settings)
+        raise ValueError("Set an auto-fetch interval above 0 before starting the mail fetcher")
+    settings["worker_enabled"] = True
+    settings["last_worker_status"] = "starting"
+    settings["last_worker_error"] = ""
+    storage.save_connector_settings("mail_poll", settings)
+    if is_mail_poll_worker_alive():
+        return mail_poll_settings()
+    mail_poll_stop_event = threading.Event()
+    mail_poll_worker_thread = MailPollWorker(mail_poll_stop_event)
+    mail_poll_worker_thread.start()
+    return mail_poll_settings()
+
+
+def stop_mail_poll_worker(status: str = "stopped", disable: bool = True) -> dict[str, Any]:
+    global mail_poll_stop_event, mail_poll_worker_thread
+    thread = mail_poll_worker_thread
+    stop_event = mail_poll_stop_event
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=5)
+    alive = thread is not None and thread.is_alive()
+    if not alive:
+        mail_poll_worker_thread = None
+        mail_poll_stop_event = None
+
+    settings = storage.get_connector_settings("mail_poll") or {}
+    if disable:
+        settings["worker_enabled"] = False
+    settings["last_worker_status"] = "stopping" if alive else status
+    if not alive:
+        settings["last_worker_error"] = ""
+    storage.save_connector_settings("mail_poll", settings)
+    return mail_poll_settings()
+
+
+def restart_mail_poll_worker() -> dict[str, Any]:
+    stop_mail_poll_worker()
+    return start_mail_poll_worker()
 
 
 def approve_processed_email(processed_email_id: int) -> dict[str, Any]:
@@ -1523,7 +1602,10 @@ def processing_page() -> str:
                 <h2>Mail Messages</h2>
                 <p>Fetch connected Outlook messages into the local queue for classification and processing.</p>
               </div>
-              <span class="pill" id="outlook-pill">Checking</span>
+              <div class="pill-stack">
+                <span class="pill" id="mail-poll-health">Fetcher checking</span>
+                <span class="pill" id="outlook-pill">Outlook checking</span>
+              </div>
             </div>
             <div class="toolbar">
               <button class="secondary" type="button" id="outlook-fetch">Fetch inbox into queue</button>
@@ -1535,6 +1617,11 @@ def processing_page() -> str:
                 <input id="mail-poll-interval" type="number" min="0" max="1440" step="0.25" placeholder="0 disables auto-fetch" />
               </div>
               <button class="secondary" type="button" id="mail-poll-save">Save auto-fetch</button>
+            </div>
+            <div class="toolbar">
+              <button type="button" id="mail-poll-start">Start fetcher</button>
+              <button class="secondary" type="button" id="mail-poll-stop">Stop fetcher</button>
+              <button class="secondary" type="button" id="mail-poll-restart">Restart fetcher</button>
             </div>
             <div class="status" id="outlook-status">Checking status...</div>
             <div class="status" id="mail-poll-status">Auto-fetch settings are loading.</div>
@@ -1666,27 +1753,49 @@ def processing_page() -> str:
 
         function renderMailPollStatus(settings) {{
           const status = document.getElementById('mail-poll-status');
+          const health = document.getElementById('mail-poll-health');
           const interval = Number(settings.interval_minutes || 0);
+          const workerStatus = settings.last_worker_status || 'stopped';
+          const healthStatus = settings.health_status || 'stopped';
+          const healthLabels = {{
+            healthy: 'Fetcher healthy',
+            degraded: 'Fetcher needs Outlook',
+            stopped: 'Fetcher stopped',
+            unhealthy: 'Fetcher unhealthy',
+            disabled: 'Fetcher disabled'
+          }};
+          health.textContent = healthLabels[healthStatus] || 'Fetcher checking';
+          health.className = healthStatus === 'healthy' ? 'pill ok' : (healthStatus === 'unhealthy' ? 'pill danger' : 'pill');
+          document.getElementById('mail-poll-start').disabled = interval <= 0 || settings.enabled;
+          document.getElementById('mail-poll-stop').disabled = !settings.enabled && !settings.worker_alive;
+          document.getElementById('mail-poll-restart').disabled = interval <= 0 || (!settings.enabled && !settings.worker_alive);
           if (!interval) {{
-            status.textContent = 'Backend auto-fetch daemon is disabled. Set a minute interval above 0 to enable it.';
+            status.textContent = 'Mail fetcher is disabled. Set the interval above 0, save it, then click Start fetcher.';
             return;
           }}
-          const workerStatus = settings.last_worker_status || 'waiting';
           const lastAttempt = settings.last_worker_attempt_at ? ` Last attempt: ${{settings.last_worker_attempt_at}}.` : '';
           const cursor = settings.last_successful_fetch_at ? ` Cursor: ${{settings.last_successful_fetch_at}}.` : '';
+          if (!settings.enabled && !settings.worker_alive) {{
+            status.textContent = `Mail fetcher is stopped. Interval is saved at ${{interval}} minute${{interval === 1 ? '' : 's'}}. Click Start fetcher to begin polling.`;
+            return;
+          }}
           if (workerStatus === 'success') {{
-            status.textContent = `Backend daemon runs every ${{interval}} minute${{interval === 1 ? '' : 's'}}. Last run ingested ${{settings.last_worker_ingested || 0}} messages and completed ${{settings.last_worker_completed_jobs || 0}} jobs.${{lastAttempt}}${{cursor}}`;
+            status.textContent = `Mail fetcher is healthy and runs every ${{interval}} minute${{interval === 1 ? '' : 's'}}. Last run ingested ${{settings.last_worker_ingested || 0}} messages and completed ${{settings.last_worker_completed_jobs || 0}} jobs.${{lastAttempt}}${{cursor}}`;
             return;
           }}
           if (workerStatus === 'waiting_for_outlook') {{
-            status.textContent = `Backend daemon is enabled every ${{interval}} minute${{interval === 1 ? '' : 's'}}, waiting for Outlook connection.${{lastAttempt}}`;
+            status.textContent = `Mail fetcher is running every ${{interval}} minute${{interval === 1 ? '' : 's'}}, but it is waiting for Outlook connection.${{lastAttempt}}`;
             return;
           }}
           if (workerStatus === 'failed') {{
-            status.textContent = `Backend daemon failed: ${{settings.last_worker_error || 'Unknown error'}}.${{lastAttempt}}`;
+            status.textContent = `Mail fetcher is unhealthy: ${{settings.last_worker_error || 'Unknown error'}}.${{lastAttempt}}`;
             return;
           }}
-          status.textContent = `Backend daemon is enabled every ${{interval}} minute${{interval === 1 ? '' : 's'}} and will run from the server process.${{lastAttempt}}`;
+          if (workerStatus === 'stopping') {{
+            status.textContent = `Mail fetcher is stopping after the current poll finishes.${{lastAttempt}}`;
+            return;
+          }}
+          status.textContent = `Mail fetcher is starting and will run every ${{interval}} minute${{interval === 1 ? '' : 's'}} from the backend.${{lastAttempt}}`;
         }}
 
         document.getElementById('mail-poll-save').addEventListener('click', async () => {{
@@ -1703,6 +1812,20 @@ def processing_page() -> str:
           }}
           renderMailPollStatus(result);
         }});
+
+        async function postMailPollAction(action) {{
+          const response = await fetch(`/api/mail-poll/${{action}}`, {{ method: 'POST' }});
+          const result = await response.json();
+          if (!response.ok) {{
+            document.getElementById('mail-poll-status').textContent = result.error || `Unable to ${{action}} mail fetcher`;
+            return;
+          }}
+          renderMailPollStatus(result);
+        }}
+
+        document.getElementById('mail-poll-start').addEventListener('click', () => postMailPollAction('start'));
+        document.getElementById('mail-poll-stop').addEventListener('click', () => postMailPollAction('stop'));
+        document.getElementById('mail-poll-restart').addEventListener('click', () => postMailPollAction('restart'));
 
         document.querySelector('.records').addEventListener('click', async (event) => {{
           const approveButton = event.target.closest('.approve-record');
@@ -1918,7 +2041,25 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/mail-poll/settings":
             try:
-                self._send_json(save_mail_poll_settings(self._read_json()))
+                result = save_mail_poll_settings(self._read_json())
+                if result["interval_minutes"] <= 0:
+                    result = stop_mail_poll_worker(status="disabled")
+                self._send_json(result)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/mail-poll/start":
+            try:
+                self._send_json(start_mail_poll_worker())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/mail-poll/stop":
+            self._send_json(stop_mail_poll_worker())
+            return
+        if path == "/api/mail-poll/restart":
+            try:
+                self._send_json(restart_mail_poll_worker())
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -2286,6 +2427,10 @@ def base_css() -> str:
         border: 1px solid #c9d4db;
       }
       button.secondary:hover { background: #e0e9ed; }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
       .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
       .poll-settings {
         display: grid;
@@ -2332,6 +2477,13 @@ def base_css() -> str:
         white-space: nowrap;
       }
       .pill.ok { color: var(--ok); border-color: #a6d4ba; background: #eef8f2; }
+      .pill.danger { color: #9d2b2b; border-color: #e4b1b1; background: #fff0f0; }
+      .pill-stack {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 6px;
+      }
       .notice {
         border: 1px solid #cddbd8;
         border-radius: 8px;
@@ -2374,16 +2526,19 @@ def base_css() -> str:
 def run() -> None:
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8080"))
-    stop_worker = threading.Event()
-    worker = MailPollWorker(stop_worker)
-    worker.start()
+    settings = storage.get_connector_settings("mail_poll") or {}
+    try:
+        interval = float(settings.get("interval_minutes", 0) or 0)
+    except (TypeError, ValueError):
+        interval = 0
+    if interval > 0 and settings.get("worker_enabled"):
+        start_mail_poll_worker()
     server = ThreadingHTTPServer((host, port), AccountantSupportHandler)
     print(f"Accountant Support running at http://{host}:{port}")
     try:
         server.serve_forever()
     finally:
-        stop_worker.set()
-        worker.join(timeout=5)
+        stop_mail_poll_worker(disable=False)
 
 
 if __name__ == "__main__":
