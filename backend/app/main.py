@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import secrets
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,8 @@ from .zoho import DryRunZohoBooksClient, ZohoConfig, ZohoOAuthClient
 
 ZOHO_BOOKS_API_ROOT = "https://www.zohoapis.com/books/v3"
 MAIL_FETCH_CURSOR_OVERLAP_MINUTES = 10
+MAIL_POLL_BATCH_SIZE = 100
+MAIL_POLL_QUEUE_BATCH_SIZE = 10
 
 
 def get_database_path() -> str:
@@ -54,6 +57,7 @@ def get_logs_root() -> str:
 
 
 storage = SQLiteStorage(get_database_path())
+mail_poll_worker_lock = threading.Lock()
 zoho_client = DryRunZohoBooksClient()
 pending_outlook_auth: DeviceCodeSession | None = None
 pending_outlook_state: str | None = None
@@ -400,10 +404,16 @@ def mail_poll_settings() -> dict[str, Any]:
     except (TypeError, ValueError):
         interval = 0
     interval = max(0.0, min(1440.0, interval))
+    worker_status = "disabled" if interval <= 0 else settings.get("last_worker_status", "waiting")
     return {
         "interval_minutes": interval,
         "enabled": interval > 0,
         "last_successful_fetch_at": settings.get("last_successful_fetch_at"),
+        "last_worker_attempt_at": settings.get("last_worker_attempt_at"),
+        "last_worker_status": worker_status,
+        "last_worker_error": settings.get("last_worker_error", ""),
+        "last_worker_ingested": settings.get("last_worker_ingested", 0),
+        "last_worker_completed_jobs": settings.get("last_worker_completed_jobs", 0),
         "saved_locally": bool(settings),
     }
 
@@ -421,6 +431,24 @@ def update_mail_fetch_cursor(fetched_at: datetime | None = None) -> dict[str, An
     settings = storage.get_connector_settings("mail_poll") or {}
     fetched_at = fetched_at or datetime.now(UTC)
     settings["last_successful_fetch_at"] = fetched_at.isoformat()
+    storage.save_connector_settings("mail_poll", settings)
+    return mail_poll_settings()
+
+
+def update_mail_poll_worker_status(
+    status: str,
+    error: str = "",
+    ingested: int = 0,
+    completed_jobs: int = 0,
+    attempted_at: datetime | None = None,
+) -> dict[str, Any]:
+    settings = storage.get_connector_settings("mail_poll") or {}
+    attempted_at = attempted_at or datetime.now(UTC)
+    settings["last_worker_attempt_at"] = attempted_at.isoformat()
+    settings["last_worker_status"] = status
+    settings["last_worker_error"] = error
+    settings["last_worker_ingested"] = ingested
+    settings["last_worker_completed_jobs"] = completed_jobs
     storage.save_connector_settings("mail_poll", settings)
     return mail_poll_settings()
 
@@ -855,6 +883,60 @@ def run_jobs(max_jobs: int = 10) -> dict[str, Any]:
         max_jobs=max_jobs,
         ai_settings=storage.get_connector_settings("ai"),
     ).to_dict()
+
+
+def run_mail_poll_worker_once() -> dict[str, Any]:
+    if not mail_poll_worker_lock.acquire(blocking=False):
+        return {"status": "skipped", "reason": "poll_already_running"}
+    attempted_at = datetime.now(UTC)
+    try:
+        fetched = ingest_outlook_messages(top=MAIL_POLL_BATCH_SIZE)
+        queued = run_jobs(max_jobs=MAIL_POLL_QUEUE_BATCH_SIZE)
+        result = {
+            "status": "success",
+            "ingested": int(fetched.get("ingested", 0)),
+            "completed_jobs": int(queued.get("completed", 0)),
+            "received_since": fetched.get("received_since"),
+            "last_successful_fetch_at": fetched.get("last_successful_fetch_at"),
+        }
+        update_mail_poll_worker_status(
+            "success",
+            ingested=result["ingested"],
+            completed_jobs=result["completed_jobs"],
+            attempted_at=attempted_at,
+        )
+        return result
+    except Exception as exc:
+        error = str(exc)
+        status = "waiting_for_outlook" if "Outlook is not connected" in error else "failed"
+        update_mail_poll_worker_status(status, error=error, attempted_at=attempted_at)
+        return {"status": status, "error": error}
+    finally:
+        mail_poll_worker_lock.release()
+
+
+class MailPollWorker(threading.Thread):
+    def __init__(self, stop_event: threading.Event) -> None:
+        super().__init__(daemon=True, name="mail-poll-worker")
+        self.stop_event = stop_event
+        self.next_run_at = 0.0
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            settings = mail_poll_settings()
+            interval_minutes = float(settings.get("interval_minutes", 0) or 0)
+            if interval_minutes <= 0:
+                self.next_run_at = 0.0
+                self.stop_event.wait(5)
+                continue
+
+            now = time.time()
+            if self.next_run_at and now < self.next_run_at:
+                self.stop_event.wait(min(5, self.next_run_at - now))
+                continue
+
+            run_mail_poll_worker_once()
+            self.next_run_at = time.time() + max(15.0, interval_minutes * 60)
 
 
 def approve_processed_email(processed_email_id: int) -> dict[str, Any]:
@@ -1504,8 +1586,6 @@ def processing_page() -> str:
       <script>
         let outlookMessages = [];
         let outlookConnected = false;
-        let mailPollTimer = null;
-        let mailPollRunning = false;
         const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
           '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
         }}[char]));
@@ -1581,50 +1661,32 @@ def processing_page() -> str:
           const response = await fetch('/api/mail-poll/settings');
           const settings = await response.json();
           document.getElementById('mail-poll-interval').value = settings.interval_minutes || 0;
-          configureMailPoll(settings.interval_minutes || 0);
+          renderMailPollStatus(settings);
         }}
 
-        function configureMailPoll(intervalMinutes) {{
-          if (mailPollTimer) {{
-            clearInterval(mailPollTimer);
-            mailPollTimer = null;
-          }}
+        function renderMailPollStatus(settings) {{
           const status = document.getElementById('mail-poll-status');
-          const interval = Number(intervalMinutes || 0);
+          const interval = Number(settings.interval_minutes || 0);
           if (!interval) {{
-            status.textContent = 'Auto-fetch is disabled. Set a minute interval above 0 to enable it.';
+            status.textContent = 'Backend auto-fetch daemon is disabled. Set a minute interval above 0 to enable it.';
             return;
           }}
-          if (!outlookConnected) {{
-            status.textContent = `Auto-fetch every ${{interval}} minute${{interval === 1 ? '' : 's'}} is saved and will start after Outlook connects.`;
-          }} else {{
-            status.textContent = `Auto-fetch is active every ${{interval}} minute${{interval === 1 ? '' : 's'}}.`;
-          }}
-          mailPollTimer = setInterval(runMailPollOnce, Math.max(15000, interval * 60 * 1000));
-        }}
-
-        async function runMailPollOnce() {{
-          if (mailPollRunning) {{
+          const workerStatus = settings.last_worker_status || 'waiting';
+          const lastAttempt = settings.last_worker_attempt_at ? ` Last attempt: ${{settings.last_worker_attempt_at}}.` : '';
+          const cursor = settings.last_successful_fetch_at ? ` Cursor: ${{settings.last_successful_fetch_at}}.` : '';
+          if (workerStatus === 'success') {{
+            status.textContent = `Backend daemon runs every ${{interval}} minute${{interval === 1 ? '' : 's'}}. Last run ingested ${{settings.last_worker_ingested || 0}} messages and completed ${{settings.last_worker_completed_jobs || 0}} jobs.${{lastAttempt}}${{cursor}}`;
             return;
           }}
-          mailPollRunning = true;
-          const status = document.getElementById('mail-poll-status');
-          status.textContent = 'Auto-fetch running...';
-          try {{
-            const outlook = await outlookStatus();
-            if (!outlook.connected) {{
-              status.textContent = 'Auto-fetch is waiting for Outlook connection.';
-              return;
-            }}
-            const fetched = await fetchInboxIntoQueue();
-            const queued = await runQueue();
-            status.textContent =
-              `Auto-fetch complete: ingested ${{fetched.ingested || 0}}, completed ${{queued.completed || 0}} jobs. Cursor updated.`;
-          }} catch (error) {{
-            status.textContent = error.message || 'Auto-fetch failed.';
-          }} finally {{
-            mailPollRunning = false;
+          if (workerStatus === 'waiting_for_outlook') {{
+            status.textContent = `Backend daemon is enabled every ${{interval}} minute${{interval === 1 ? '' : 's'}}, waiting for Outlook connection.${{lastAttempt}}`;
+            return;
           }}
+          if (workerStatus === 'failed') {{
+            status.textContent = `Backend daemon failed: ${{settings.last_worker_error || 'Unknown error'}}.${{lastAttempt}}`;
+            return;
+          }}
+          status.textContent = `Backend daemon is enabled every ${{interval}} minute${{interval === 1 ? '' : 's'}} and will run from the server process.${{lastAttempt}}`;
         }}
 
         document.getElementById('mail-poll-save').addEventListener('click', async () => {{
@@ -1639,7 +1701,7 @@ def processing_page() -> str:
             document.getElementById('mail-poll-status').textContent = result.error || 'Unable to save auto-fetch settings';
             return;
           }}
-          configureMailPoll(result.interval_minutes || 0);
+          renderMailPollStatus(result);
         }});
 
         document.querySelector('.records').addEventListener('click', async (event) => {{
@@ -1743,6 +1805,7 @@ def processing_page() -> str:
         }}
 
         outlookStatus().then(refreshMailPollSettings);
+        setInterval(refreshMailPollSettings, 30000);
         refreshQueueStatus();
         applyHistoryFilters();
       </script>
@@ -2311,9 +2374,16 @@ def base_css() -> str:
 def run() -> None:
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8080"))
+    stop_worker = threading.Event()
+    worker = MailPollWorker(stop_worker)
+    worker.start()
     server = ThreadingHTTPServer((host, port), AccountantSupportHandler)
     print(f"Accountant Support running at http://{host}:{port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        stop_worker.set()
+        worker.join(timeout=5)
 
 
 if __name__ == "__main__":

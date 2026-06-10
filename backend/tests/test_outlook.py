@@ -1,10 +1,12 @@
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 from app.main import (
     mail_fetch_since_from_cursor,
     mail_poll_settings,
+    run_mail_poll_worker_once,
     save_mail_poll_settings,
     save_outlook_settings,
     storage,
@@ -184,6 +186,23 @@ class OutlookConfigTest(unittest.TestCase):
             self.assertEqual(status["last_successful_fetch_at"], "2026-06-09T12:00:00+00:00")
             self.assertEqual(mail_fetch_since_from_cursor(), "2026-06-09T11:50:00Z")
             self.assertEqual(mail_poll_settings()["interval_minutes"], 5)
+        finally:
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
+
+    def test_mail_poll_worker_reports_waiting_for_outlook(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            save_mail_poll_settings({"interval_minutes": "5"})
+            with patch("app.main.get_outlook_token", side_effect=ValueError("Outlook is not connected")):
+                result = run_mail_poll_worker_once()
+
+            settings = mail_poll_settings()
+            self.assertEqual(result["status"], "waiting_for_outlook")
+            self.assertEqual(settings["last_worker_status"], "waiting_for_outlook")
+            self.assertIn("Outlook is not connected", settings["last_worker_error"])
         finally:
             if original is not None:
                 storage.save_connector_settings("mail_poll", original)
