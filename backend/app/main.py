@@ -25,6 +25,7 @@ from .ai import (
     create_ai_processor,
 )
 from .billing import BillAttachment, save_billing_artifacts
+from .gmail import GmailClient, GmailConfig
 from .jobs import REVIEW_ACCOUNT, enqueue_mail_message, queue_status, run_queue_once
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
 from .pdf_context import append_attachment_context, build_attachment_context
@@ -63,6 +64,7 @@ mail_poll_stop_event: threading.Event | None = None
 zoho_client = DryRunZohoBooksClient()
 pending_outlook_auth: DeviceCodeSession | None = None
 pending_outlook_state: str | None = None
+pending_gmail_state: str | None = None
 pending_zoho_state: str | None = None
 
 
@@ -93,17 +95,24 @@ def process_email_sample(email: EmailSampleIn) -> ProcessedEmail:
 def process_mail_message(message: MailMessage) -> ProcessedEmail:
     attachments = []
     email = message.to_email()
-    if message.provider == "outlook":
-        attachments = _list_outlook_bill_attachments(message)
+    if message.provider in {"outlook", "gmail"}:
+        attachments = _list_bill_attachments(message)
         email = _email_with_attachment_context(email, attachments)
     record = process_email_sample(email)
-    if message.provider == "outlook":
-        artifacts = _handle_outlook_billing_artifacts(message, record, attachments)
+    if message.provider in {"outlook", "gmail"}:
+        artifacts = _handle_billing_artifacts(message, record, attachments)
         record = _finalize_processed_email(record, artifacts.saved_files)
     return record
 
 
-def _list_outlook_bill_attachments(message: MailMessage) -> list[BillAttachment]:
+def _list_bill_attachments(message: MailMessage) -> list[BillAttachment]:
+    if message.provider == "gmail":
+        token = get_gmail_token()
+        client = get_gmail_client()
+        return [
+            BillAttachment(name=attachment.name, content=attachment.content)
+            for attachment in client.list_file_attachments(token, message.provider_message_id)
+        ]
     token = get_outlook_token()
     client = get_outlook_client()
     return [
@@ -123,13 +132,11 @@ def _email_with_attachment_context(
     )
 
 
-def _handle_outlook_billing_artifacts(
+def _handle_billing_artifacts(
     message: MailMessage,
     record: ProcessedEmail,
     attachments: list[BillAttachment],
 ) -> Any:
-    token = get_outlook_token()
-    client = get_outlook_client()
     artifacts = save_billing_artifacts(
         message=message,
         processed=record,
@@ -141,6 +148,8 @@ def _handle_outlook_billing_artifacts(
     if receiver:
         email_date = artifacts.daily_log.stem.replace("billing-log-", "", 1)
         try:
+            token = get_gmail_token() if message.provider == "gmail" else get_outlook_token()
+            client = get_gmail_client() if message.provider == "gmail" else get_outlook_client()
             client.send_mail(
                 token=token,
                 to_address=receiver,
@@ -207,6 +216,10 @@ def get_outlook_client() -> OutlookGraphClient:
     return OutlookGraphClient(
         OutlookConfig.from_settings(storage.get_connector_settings("outlook"))
     )
+
+
+def get_gmail_client() -> GmailClient:
+    return GmailClient(GmailConfig.from_settings(storage.get_connector_settings("gmail")))
 
 
 def get_zoho_oauth_client() -> ZohoOAuthClient:
@@ -282,6 +295,65 @@ def _outlook_account_type(tenant_id: str) -> str:
     if tenant_id in {"common", "organizations", "consumers"}:
         return tenant_id
     return "custom"
+
+
+def gmail_status() -> dict[str, Any]:
+    settings = storage.get_connector_settings("gmail") or {}
+    client = get_gmail_client()
+    required_scopes = [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+    ]
+    configured_scopes = set(client.config.scopes.split())
+    status = client.configured_status(has_token=storage.get_oauth_token("gmail") is not None)
+    status["settings"] = {
+        "client_id": client.config.client_id,
+        "redirect_uri": client.config.redirect_uri,
+        "scopes": client.config.scopes,
+        "required_scopes": " ".join(required_scopes),
+        "missing_scopes": [scope for scope in required_scopes if scope not in configured_scopes],
+        "saved_locally": bool(settings),
+        "has_client_secret": bool(client.config.client_secret),
+    }
+    return status
+
+
+def save_gmail_settings(data: dict[str, Any]) -> dict[str, Any]:
+    existing = storage.get_connector_settings("gmail") or {}
+    env_config = GmailConfig.from_env()
+    client_id = str(data.get("client_id", existing.get("client_id", env_config.client_id))).strip()
+    client_secret = str(data.get("client_secret", "")).strip() or str(
+        existing.get("client_secret", env_config.client_secret)
+    ).strip()
+    redirect_uri = str(
+        data.get(
+            "redirect_uri",
+            existing.get("redirect_uri", env_config.redirect_uri),
+        )
+    ).strip()
+    scopes = str(data.get("scopes", existing.get("scopes", env_config.scopes))).strip()
+    for scope in [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+    ]:
+        if scope not in scopes.split():
+            scopes = f"{scopes} {scope}".strip()
+    if not client_id:
+        raise ValueError("client_id is required")
+    if not client_secret:
+        raise ValueError("client_secret is required")
+    if not redirect_uri:
+        raise ValueError("redirect_uri is required")
+    storage.save_connector_settings(
+        "gmail",
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+            "scopes": scopes,
+        },
+    )
+    return gmail_status()
 
 
 def zoho_status() -> dict[str, Any]:
@@ -406,8 +478,22 @@ def is_outlook_configured() -> bool:
     return get_outlook_client().config.is_configured
 
 
+def active_mail_provider() -> str:
+    settings = storage.get_connector_settings("mail_poll") or {}
+    provider = str(settings.get("mail_provider", "outlook")).strip().lower()
+    return provider if provider in {"outlook", "gmail"} else "outlook"
+
+
+def is_mail_provider_configured(provider: str | None = None) -> bool:
+    provider = provider or active_mail_provider()
+    if provider == "gmail":
+        return get_gmail_client().config.is_configured
+    return is_outlook_configured()
+
+
 def mail_poll_settings() -> dict[str, Any]:
     settings = storage.get_connector_settings("mail_poll") or {}
+    provider = active_mail_provider()
     interval = settings.get("interval_minutes", 0)
     try:
         interval = float(interval)
@@ -421,12 +507,12 @@ def mail_poll_settings() -> dict[str, Any]:
         worker_status = "disabled"
     elif not worker_enabled:
         worker_status = "stopped"
-    elif not worker_alive and worker_status not in {"failed", "waiting_for_outlook"}:
+    elif not worker_alive and worker_status not in {"failed", "waiting_for_mail", "waiting_for_outlook"}:
         worker_status = "stopped"
     health_status = "disabled"
     if worker_enabled and worker_alive and worker_status in {"success", "waiting", "starting"}:
         health_status = "healthy"
-    elif worker_enabled and worker_alive and worker_status == "waiting_for_outlook":
+    elif worker_enabled and worker_alive and worker_status in {"waiting_for_mail", "waiting_for_outlook"}:
         health_status = "degraded"
     elif interval > 0 and not worker_enabled:
         health_status = "stopped"
@@ -437,8 +523,9 @@ def mail_poll_settings() -> dict[str, Any]:
         "enabled": worker_enabled,
         "worker_alive": worker_alive,
         "health_status": health_status,
-        "mail_configured": is_outlook_configured(),
-        "last_successful_fetch_at": settings.get("last_successful_fetch_at"),
+        "mail_provider": provider,
+        "mail_configured": is_mail_provider_configured(provider),
+        "last_successful_fetch_at": settings.get(f"{provider}_last_successful_fetch_at") or settings.get("last_successful_fetch_at"),
         "last_worker_attempt_at": settings.get("last_worker_attempt_at"),
         "last_worker_status": worker_status,
         "last_worker_error": settings.get("last_worker_error", ""),
@@ -450,9 +537,11 @@ def mail_poll_settings() -> dict[str, Any]:
 
 def save_mail_poll_settings(data: dict[str, Any]) -> dict[str, Any]:
     settings = storage.get_connector_settings("mail_poll") or {}
-    interval = float(data.get("interval_minutes", 0))
+    interval = float(data.get("interval_minutes", settings.get("interval_minutes", 0)))
     interval = max(0.0, min(1440.0, interval))
     settings["interval_minutes"] = interval
+    provider = str(data.get("mail_provider", settings.get("mail_provider", "outlook"))).strip().lower()
+    settings["mail_provider"] = provider if provider in {"outlook", "gmail"} else "outlook"
     if interval <= 0:
         settings["worker_enabled"] = False
         settings["last_worker_status"] = "disabled"
@@ -461,10 +550,11 @@ def save_mail_poll_settings(data: dict[str, Any]) -> dict[str, Any]:
     return mail_poll_settings()
 
 
-def update_mail_fetch_cursor(fetched_at: datetime | None = None) -> dict[str, Any]:
+def update_mail_fetch_cursor(fetched_at: datetime | None = None, provider: str | None = None) -> dict[str, Any]:
     settings = storage.get_connector_settings("mail_poll") or {}
     fetched_at = fetched_at or datetime.now(UTC)
-    settings["last_successful_fetch_at"] = fetched_at.isoformat()
+    provider = provider or active_mail_provider()
+    settings[f"{provider}_last_successful_fetch_at"] = fetched_at.isoformat()
     storage.save_connector_settings("mail_poll", settings)
     return mail_poll_settings()
 
@@ -487,9 +577,10 @@ def update_mail_poll_worker_status(
     return mail_poll_settings()
 
 
-def mail_fetch_since_from_cursor() -> str | None:
+def mail_fetch_since_from_cursor(provider: str | None = None) -> str | None:
     settings = storage.get_connector_settings("mail_poll") or {}
-    cursor = settings.get("last_successful_fetch_at")
+    provider = provider or active_mail_provider()
+    cursor = settings.get(f"{provider}_last_successful_fetch_at") or settings.get("last_successful_fetch_at")
     if not cursor:
         return None
     try:
@@ -804,6 +895,33 @@ def complete_outlook_redirect_auth(query: str) -> str:
     )
 
 
+def start_gmail_redirect_auth() -> str:
+    global pending_gmail_state
+    pending_gmail_state = secrets.token_urlsafe(24)
+    return get_gmail_client().authorization_url(pending_gmail_state)
+
+
+def complete_gmail_redirect_auth(query: str) -> str:
+    global pending_gmail_state
+    params = parse_qs(query)
+    if "error" in params:
+        return auth_result_page("Gmail connection failed", params["error"][0], False)
+    code = params.get("code", [""])[0]
+    state = params.get("state", [""])[0]
+    if not code:
+        return auth_result_page("Gmail connection failed", "Missing authorization code.", False)
+    if not pending_gmail_state or state != pending_gmail_state:
+        return auth_result_page("Gmail connection failed", "Invalid authorization state.", False)
+    token = get_gmail_client().exchange_authorization_code(code)
+    storage.save_oauth_token("gmail", token)
+    pending_gmail_state = None
+    return auth_result_page(
+        "Gmail connected",
+        "Gmail is connected. Return to Accountant Supporter to fetch messages.",
+        True,
+    )
+
+
 def start_zoho_redirect_auth() -> str:
     global pending_zoho_state
     zoho_oauth = get_zoho_oauth_client()
@@ -862,6 +980,16 @@ def get_outlook_token() -> dict[str, Any]:
     return token
 
 
+def get_gmail_token() -> dict[str, Any]:
+    token = storage.get_oauth_token("gmail")
+    if not token:
+        raise ValueError("Gmail is not connected")
+    if float(token.get("expires_at", 0)) <= time.time() + 60:
+        token = get_gmail_client().refresh_token(token)
+        storage.save_oauth_token("gmail", token)
+    return token
+
+
 def list_outlook_messages(top: int = 100) -> list[dict[str, Any]]:
     token = get_outlook_token()
     return [
@@ -869,14 +997,26 @@ def list_outlook_messages(top: int = 100) -> list[dict[str, Any]]:
         for message in get_outlook_client().list_inbox_messages(
             token=token,
             top=top,
-            received_since=mail_fetch_since_from_cursor(),
+            received_since=mail_fetch_since_from_cursor("outlook"),
+        )
+    ]
+
+
+def list_gmail_messages(top: int = 100) -> list[dict[str, Any]]:
+    token = get_gmail_token()
+    return [
+        message.to_dict()
+        for message in get_gmail_client().list_inbox_messages(
+            token=token,
+            top=top,
+            received_since=mail_fetch_since_from_cursor("gmail"),
         )
     ]
 
 
 def ingest_outlook_messages(top: int = 100) -> dict[str, Any]:
     token = get_outlook_token()
-    received_since = mail_fetch_since_from_cursor()
+    received_since = mail_fetch_since_from_cursor("outlook")
     fetched_at = datetime.now(UTC)
     messages = get_outlook_client().list_inbox_messages(
         token=token,
@@ -900,13 +1040,52 @@ def ingest_outlook_messages(top: int = 100) -> dict[str, Any]:
         item["classification_status"] = stored.classification_status
         item["classification_job_id"] = job.id
         ingested.append(item)
-    poll_settings = update_mail_fetch_cursor(fetched_at)
+    poll_settings = update_mail_fetch_cursor(fetched_at, "outlook")
     return {
         "messages": ingested,
         "ingested": len(ingested),
         "received_since": received_since,
         "last_successful_fetch_at": poll_settings["last_successful_fetch_at"],
     }
+
+
+def ingest_gmail_messages(top: int = 100) -> dict[str, Any]:
+    token = get_gmail_token()
+    received_since = mail_fetch_since_from_cursor("gmail")
+    fetched_at = datetime.now(UTC)
+    messages = get_gmail_client().list_inbox_messages(
+        token=token,
+        top=top,
+        received_since=received_since,
+    )
+    ingested: list[dict[str, Any]] = []
+    for message in messages:
+        stored = storage.save_mail_message(
+            provider="gmail",
+            provider_message_id=message.id,
+            received_at=message.received_at,
+            subject=message.subject,
+            sender=message.sender,
+            body_preview=message.body_preview,
+            body=message.body,
+        )
+        job = enqueue_mail_message(storage, stored)
+        item = message.to_dict()
+        item["mail_message_id"] = stored.id
+        item["classification_status"] = stored.classification_status
+        item["classification_job_id"] = job.id
+        ingested.append(item)
+    poll_settings = update_mail_fetch_cursor(fetched_at, "gmail")
+    return {
+        "messages": ingested,
+        "ingested": len(ingested),
+        "received_since": received_since,
+        "last_successful_fetch_at": poll_settings["last_successful_fetch_at"],
+    }
+
+
+def ingest_mail_messages(top: int = 100) -> dict[str, Any]:
+    return ingest_gmail_messages(top=top) if active_mail_provider() == "gmail" else ingest_outlook_messages(top=top)
 
 
 def run_jobs(max_jobs: int = 10) -> dict[str, Any]:
@@ -924,7 +1103,7 @@ def run_mail_poll_worker_once() -> dict[str, Any]:
         return {"status": "skipped", "reason": "poll_already_running"}
     attempted_at = datetime.now(UTC)
     try:
-        fetched = ingest_outlook_messages(top=MAIL_POLL_BATCH_SIZE)
+        fetched = ingest_mail_messages(top=MAIL_POLL_BATCH_SIZE)
         queued = run_jobs(max_jobs=MAIL_POLL_QUEUE_BATCH_SIZE)
         result = {
             "status": "success",
@@ -942,7 +1121,7 @@ def run_mail_poll_worker_once() -> dict[str, Any]:
         return result
     except Exception as exc:
         error = str(exc)
-        status = "waiting_for_outlook" if "Outlook is not connected" in error else "failed"
+        status = "waiting_for_mail" if "is not connected" in error else "failed"
         update_mail_poll_worker_status(status, error=error, attempted_at=attempted_at)
         return {"status": status, "error": error}
     finally:
@@ -983,12 +1162,12 @@ def start_mail_poll_worker() -> dict[str, Any]:
         settings["last_worker_error"] = "Set an auto-fetch interval above 0 before starting."
         storage.save_connector_settings("mail_poll", settings)
         raise ValueError("Set an auto-fetch interval above 0 before starting the mail fetcher")
-    if not is_outlook_configured():
+    if not is_mail_provider_configured():
         settings["worker_enabled"] = False
         settings["last_worker_status"] = "stopped"
-        settings["last_worker_error"] = "Configure the Outlook mail connection before starting."
+        settings["last_worker_error"] = f"Configure the {active_mail_provider()} mail connection before starting."
         storage.save_connector_settings("mail_poll", settings)
-        raise ValueError("Configure the Outlook mail connection before starting the mail fetcher")
+        raise ValueError(f"Configure the {active_mail_provider()} mail connection before starting the mail fetcher")
     settings["worker_enabled"] = True
     settings["last_worker_status"] = "starting"
     settings["last_worker_error"] = ""
@@ -1148,7 +1327,7 @@ def index() -> str:
           <div class="connector-head">
             <div>
               <h2>Mail Authentication</h2>
-              <p>Connect Outlook so the app can read selected mailbox messages for summarization.</p>
+              <p>Connect Outlook or Gmail so the app can read selected mailbox messages for summarization.</p>
             </div>
             <span class="pill" id="outlook-pill">Checking</span>
           </div>
@@ -1178,6 +1357,38 @@ def index() -> str:
             </div>
           </div>
           <div class="status" id="outlook-save-status"></div>
+
+          <div class="history-head">
+            <h2>Gmail Authentication</h2>
+            <p>Connect Gmail so the app can read bill messages from a Gmail inbox.</p>
+          </div>
+          <div class="connector-head">
+            <div>
+              <label for="mail-provider">Mail Provider Used By Fetcher</label>
+              <select id="mail-provider">
+                <option value="outlook">Outlook</option>
+                <option value="gmail">Gmail</option>
+              </select>
+            </div>
+            <span class="pill" id="gmail-pill">Checking</span>
+          </div>
+          <div class="toolbar">
+            <a class="button-link" id="gmail-connect" href="/auth/gmail/start" target="_blank" rel="noopener noreferrer">Connect Gmail</a>
+          </div>
+          <div class="status" id="gmail-status">Checking Gmail status...</div>
+          <div class="notice" id="gmail-config"></div>
+          <label for="gmail-client-id">Google OAuth Client ID</label>
+          <input id="gmail-client-id" autocomplete="off" placeholder="Google Cloud OAuth client ID" />
+          <label for="gmail-client-secret">Google OAuth Client Secret</label>
+          <input id="gmail-client-secret" type="password" autocomplete="off" placeholder="Paste secret to save or rotate" />
+          <label for="gmail-redirect-uri">Gmail Redirect URI</label>
+          <input id="gmail-redirect-uri" autocomplete="off" placeholder="http://127.0.0.1:8080/auth/gmail/callback" />
+          <label for="gmail-scopes">Gmail Scopes</label>
+          <input id="gmail-scopes" autocomplete="off" placeholder="https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send" />
+          <div class="toolbar">
+            <button class="secondary" type="button" id="gmail-save">Save Gmail settings</button>
+          </div>
+          <div class="status" id="gmail-save-status"></div>
         </section>
 
         <section class="connection-card">
@@ -1269,7 +1480,7 @@ def index() -> str:
       </main>
       <script>
         async function refreshConnectionStatus() {
-          await Promise.all([refreshOutlookStatus(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshApprovalSettings()]);
+          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshApprovalSettings()]);
         }
 
         async function refreshOutlookStatus() {
@@ -1412,6 +1623,78 @@ def index() -> str:
           }
           document.getElementById('outlook-save-status').textContent = 'Outlook settings saved locally.';
           await refreshOutlookStatus();
+        });
+
+        async function refreshGmailStatus() {
+          const response = await fetch('/api/gmail/status');
+          const status = await response.json();
+          const target = document.getElementById('gmail-status');
+          const pill = document.getElementById('gmail-pill');
+          const config = document.getElementById('gmail-config');
+          const connect = document.getElementById('gmail-connect');
+          document.getElementById('gmail-client-id').value = status.settings?.client_id || '';
+          document.getElementById('gmail-client-secret').value = '';
+          document.getElementById('gmail-redirect-uri').value =
+            status.settings?.redirect_uri || 'http://127.0.0.1:8080/auth/gmail/callback';
+          document.getElementById('gmail-scopes').value =
+            status.settings?.scopes || 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send';
+          if (!status.configured) {
+            target.textContent = 'Gmail authentication is not configured yet.';
+            config.textContent = 'Create a Google OAuth client, add the redirect URI, then save the Client ID and Secret.';
+            pill.textContent = 'Not configured';
+            pill.className = 'pill';
+            connect.removeAttribute('href');
+            connect.setAttribute('aria-disabled', 'true');
+            connect.className = 'button-link disabled';
+            return;
+          }
+          connect.setAttribute('href', '/auth/gmail/start');
+          connect.removeAttribute('aria-disabled');
+          connect.className = 'button-link';
+          const missingScopes = status.settings?.missing_scopes || [];
+          const scopeMessage = missingScopes.length
+            ? ` Missing scopes: ${missingScopes.join(', ')}. Reconnect Gmail after updating scopes.`
+            : '';
+          config.textContent =
+            `Redirect URI: ${status.settings?.redirect_uri || ''} | Required scopes: ${status.settings?.required_scopes || ''}.${scopeMessage}`;
+          pill.textContent = status.connected ? 'Connected' : 'Configured';
+          pill.className = status.connected ? 'pill ok' : 'pill';
+          target.textContent = status.connected ? 'Gmail is connected' : 'Ready to connect Gmail';
+        }
+
+        async function refreshMailProviderSettings() {
+          const response = await fetch('/api/mail-poll/settings');
+          const settings = await response.json();
+          document.getElementById('mail-provider').value = settings.mail_provider || 'outlook';
+        }
+
+        document.getElementById('mail-provider').addEventListener('change', async () => {
+          const response = await fetch('/api/mail-poll/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mail_provider: document.getElementById('mail-provider').value })
+          });
+          await response.json();
+        });
+
+        document.getElementById('gmail-save').addEventListener('click', async () => {
+          const response = await fetch('/api/gmail/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              client_id: document.getElementById('gmail-client-id').value,
+              client_secret: document.getElementById('gmail-client-secret').value,
+              redirect_uri: document.getElementById('gmail-redirect-uri').value,
+              scopes: document.getElementById('gmail-scopes').value
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            document.getElementById('gmail-save-status').textContent = result.error || 'Unable to save Gmail settings';
+            return;
+          }
+          document.getElementById('gmail-save-status').textContent = 'Gmail settings saved locally.';
+          await refreshGmailStatus();
         });
 
         async function refreshZohoStatus() {
@@ -1611,11 +1894,11 @@ def processing_page() -> str:
             <div class="connector-head">
               <div>
                 <h2>Mail Messages</h2>
-                <p>Fetch connected Outlook messages into the local queue for classification and processing.</p>
+                <p>Fetch connected mail messages into the local queue for classification and processing.</p>
               </div>
               <div class="pill-stack">
                 <span class="pill" id="mail-poll-health">Fetcher checking</span>
-                <span class="pill" id="outlook-pill">Outlook checking</span>
+                <span class="pill" id="outlook-pill">Mail checking</span>
               </div>
             </div>
             <div class="toolbar">
@@ -1685,6 +1968,7 @@ def processing_page() -> str:
         let outlookMessages = [];
         let outlookConnected = false;
         let outlookConfigured = false;
+        let mailProvider = 'outlook';
         const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
           '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
         }}[char]));
@@ -1703,7 +1987,8 @@ def processing_page() -> str:
         }}
 
         async function fetchInboxIntoQueue() {{
-          const response = await fetch('/api/outlook/messages?top=100');
+          const providerPath = mailProvider === 'gmail' ? 'gmail' : 'outlook';
+          const response = await fetch(`/api/${{providerPath}}/messages?top=100`);
           const result = await response.json();
           if (!response.ok) {{
             document.getElementById('outlook-messages').textContent = result.error || 'Unable to fetch messages';
@@ -1760,6 +2045,7 @@ def processing_page() -> str:
         async function refreshMailPollSettings() {{
           const response = await fetch('/api/mail-poll/settings');
           const settings = await response.json();
+          mailProvider = settings.mail_provider || 'outlook';
           document.getElementById('mail-poll-interval').value = settings.interval_minutes || 0;
           renderMailPollStatus(settings);
         }}
@@ -1773,7 +2059,7 @@ def processing_page() -> str:
           const healthStatus = settings.health_status || 'stopped';
           const healthLabels = {{
             healthy: 'Fetcher healthy',
-            degraded: 'Fetcher needs Outlook',
+            degraded: 'Fetcher needs mail',
             stopped: 'Fetcher stopped',
             unhealthy: 'Fetcher unhealthy',
             disabled: 'Fetcher disabled'
@@ -1788,7 +2074,7 @@ def processing_page() -> str:
             return;
           }}
           if (!mailConfigured) {{
-            status.textContent = 'Mail fetcher is stopped because Outlook mail connection is not configured. Configure Mail Authentication first.';
+            status.textContent = `Mail fetcher is stopped because ${{mailProvider === 'gmail' ? 'Gmail' : 'Outlook'}} mail connection is not configured. Configure Mail Authentication first.`;
             return;
           }}
           const lastAttempt = settings.last_worker_attempt_at ? ` Last attempt: ${{settings.last_worker_attempt_at}}.` : '';
@@ -1801,8 +2087,8 @@ def processing_page() -> str:
             status.textContent = `Mail fetcher is healthy and runs every ${{interval}} minute${{interval === 1 ? '' : 's'}}. Last run ingested ${{settings.last_worker_ingested || 0}} messages and completed ${{settings.last_worker_completed_jobs || 0}} jobs.${{lastAttempt}}${{cursor}}`;
             return;
           }}
-          if (workerStatus === 'waiting_for_outlook') {{
-            status.textContent = `Mail fetcher is running every ${{interval}} minute${{interval === 1 ? '' : 's'}}, but it is waiting for Outlook connection.${{lastAttempt}}`;
+          if (workerStatus === 'waiting_for_mail' || workerStatus === 'waiting_for_outlook') {{
+            status.textContent = `Mail fetcher is running every ${{interval}} minute${{interval === 1 ? '' : 's'}}, but it is waiting for ${{mailProvider === 'gmail' ? 'Gmail' : 'Outlook'}} connection.${{lastAttempt}}`;
             return;
           }}
           if (workerStatus === 'failed') {{
@@ -1971,6 +2257,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/auth/outlook/callback":
             self._send_html(complete_outlook_redirect_auth(urlparse(self.path).query))
             return
+        if path == "/auth/gmail/start":
+            self._auth_redirect(start_gmail_redirect_auth, "Gmail setup needed")
+            return
+        if path == "/auth/gmail/callback":
+            self._send_html(complete_gmail_redirect_auth(urlparse(self.path).query))
+            return
         if path == "/auth/zoho/start":
             self._auth_redirect(start_zoho_redirect_auth, "Zoho Books setup needed")
             return
@@ -1990,6 +2282,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/outlook/status":
             self._send_json(outlook_status())
             return
+        if path == "/api/gmail/status":
+            self._send_json(gmail_status())
+            return
         if path == "/api/zoho/status":
             self._send_json(zoho_status())
             return
@@ -2007,6 +2302,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/outlook/messages":
             self._send_outlook_messages()
+            return
+        if path == "/api/gmail/messages":
+            self._send_gmail_messages()
             return
         if path == "/api/jobs/status":
             self._send_json(queue_status(storage))
@@ -2030,6 +2328,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/outlook/settings":
             try:
                 self._send_json(save_outlook_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/gmail/settings":
+            try:
+                self._send_json(save_gmail_settings(self._read_json()))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -2163,6 +2467,18 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             top = 100
         try:
             self._send_json(ingest_outlook_messages(top=top))
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _send_gmail_messages(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        top = 100
+        try:
+            top = int(query.get("top", ["100"])[0])
+        except ValueError:
+            top = 100
+        try:
+            self._send_json(ingest_gmail_messages(top=top))
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 

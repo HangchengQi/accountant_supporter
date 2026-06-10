@@ -243,8 +243,8 @@ class OutlookConfigTest(unittest.TestCase):
                 result = run_mail_poll_worker_once()
 
             settings = storage.get_connector_settings("mail_poll") or {}
-            self.assertEqual(result["status"], "waiting_for_outlook")
-            self.assertEqual(settings["last_worker_status"], "waiting_for_outlook")
+            self.assertEqual(result["status"], "waiting_for_mail")
+            self.assertEqual(settings["last_worker_status"], "waiting_for_mail")
             self.assertIn("Outlook is not connected", settings["last_worker_error"])
         finally:
             if original is not None:
