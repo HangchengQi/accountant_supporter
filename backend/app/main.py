@@ -402,6 +402,10 @@ def is_mail_poll_worker_alive() -> bool:
     return mail_poll_worker_thread is not None and mail_poll_worker_thread.is_alive()
 
 
+def is_outlook_configured() -> bool:
+    return get_outlook_client().config.is_configured
+
+
 def mail_poll_settings() -> dict[str, Any]:
     settings = storage.get_connector_settings("mail_poll") or {}
     interval = settings.get("interval_minutes", 0)
@@ -433,6 +437,7 @@ def mail_poll_settings() -> dict[str, Any]:
         "enabled": worker_enabled,
         "worker_alive": worker_alive,
         "health_status": health_status,
+        "mail_configured": is_outlook_configured(),
         "last_successful_fetch_at": settings.get("last_successful_fetch_at"),
         "last_worker_attempt_at": settings.get("last_worker_attempt_at"),
         "last_worker_status": worker_status,
@@ -978,6 +983,12 @@ def start_mail_poll_worker() -> dict[str, Any]:
         settings["last_worker_error"] = "Set an auto-fetch interval above 0 before starting."
         storage.save_connector_settings("mail_poll", settings)
         raise ValueError("Set an auto-fetch interval above 0 before starting the mail fetcher")
+    if not is_outlook_configured():
+        settings["worker_enabled"] = False
+        settings["last_worker_status"] = "stopped"
+        settings["last_worker_error"] = "Configure the Outlook mail connection before starting."
+        storage.save_connector_settings("mail_poll", settings)
+        raise ValueError("Configure the Outlook mail connection before starting the mail fetcher")
     settings["worker_enabled"] = True
     settings["last_worker_status"] = "starting"
     settings["last_worker_error"] = ""
@@ -1673,6 +1684,7 @@ def processing_page() -> str:
       <script>
         let outlookMessages = [];
         let outlookConnected = false;
+        let outlookConfigured = false;
         const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
           '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
         }}[char]));
@@ -1683,6 +1695,7 @@ def processing_page() -> str:
           const target = document.getElementById('outlook-status');
           const pill = document.getElementById('outlook-pill');
           outlookConnected = Boolean(status.connected);
+          outlookConfigured = Boolean(status.configured);
           pill.textContent = status.connected ? 'Connected' : 'Not connected';
           pill.className = status.connected ? 'pill ok' : 'pill';
           target.textContent = status.connected ? 'Outlook is connected' : 'Connect Outlook on the Connections page first';
@@ -1755,6 +1768,7 @@ def processing_page() -> str:
           const status = document.getElementById('mail-poll-status');
           const health = document.getElementById('mail-poll-health');
           const interval = Number(settings.interval_minutes || 0);
+          const mailConfigured = Boolean(settings.mail_configured || outlookConfigured);
           const workerStatus = settings.last_worker_status || 'stopped';
           const healthStatus = settings.health_status || 'stopped';
           const healthLabels = {{
@@ -1766,11 +1780,15 @@ def processing_page() -> str:
           }};
           health.textContent = healthLabels[healthStatus] || 'Fetcher checking';
           health.className = healthStatus === 'healthy' ? 'pill ok' : (healthStatus === 'unhealthy' ? 'pill danger' : 'pill');
-          document.getElementById('mail-poll-start').disabled = interval <= 0 || settings.enabled;
+          document.getElementById('mail-poll-start').disabled = interval <= 0 || settings.enabled || !mailConfigured;
           document.getElementById('mail-poll-stop').disabled = !settings.enabled && !settings.worker_alive;
           document.getElementById('mail-poll-restart').disabled = interval <= 0 || (!settings.enabled && !settings.worker_alive);
           if (!interval) {{
             status.textContent = 'Mail fetcher is disabled. Set the interval above 0, save it, then click Start fetcher.';
+            return;
+          }}
+          if (!mailConfigured) {{
+            status.textContent = 'Mail fetcher is stopped because Outlook mail connection is not configured. Configure Mail Authentication first.';
             return;
           }}
           const lastAttempt = settings.last_worker_attempt_at ? ` Last attempt: ${{settings.last_worker_attempt_at}}.` : '';

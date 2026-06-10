@@ -184,7 +184,8 @@ class OutlookConfigTest(unittest.TestCase):
         original = storage.get_connector_settings("mail_poll")
         try:
             save_mail_poll_settings({"interval_minutes": "5"})
-            started = start_mail_poll_worker()
+            with patch("app.main.is_outlook_configured", return_value=True):
+                started = start_mail_poll_worker()
 
             self.assertTrue(started["enabled"])
             self.assertTrue(started["worker_alive"])
@@ -193,6 +194,25 @@ class OutlookConfigTest(unittest.TestCase):
             self.assertFalse(stopped["enabled"])
             self.assertFalse(stopped["worker_alive"])
             self.assertEqual(stopped["health_status"], "stopped")
+        finally:
+            stop_mail_poll_worker()
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
+
+    def test_mail_poll_worker_start_requires_outlook_configuration(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            save_mail_poll_settings({"interval_minutes": "5"})
+            with patch("app.main.is_outlook_configured", return_value=False):
+                with self.assertRaises(ValueError):
+                    start_mail_poll_worker()
+
+            settings = mail_poll_settings()
+            self.assertFalse(settings["enabled"])
+            self.assertFalse(settings["worker_alive"])
+            self.assertEqual(settings["health_status"], "stopped")
         finally:
             stop_mail_poll_worker()
             if original is not None:
