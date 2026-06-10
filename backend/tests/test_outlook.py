@@ -1,6 +1,15 @@
 import unittest
+from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
 
-from app.main import mail_poll_settings, save_mail_poll_settings, save_outlook_settings, storage
+from app.main import (
+    mail_fetch_since_from_cursor,
+    mail_poll_settings,
+    save_mail_poll_settings,
+    save_outlook_settings,
+    storage,
+    update_mail_fetch_cursor,
+)
 from app.outlook import OutlookConfig, OutlookGraphClient
 
 
@@ -55,6 +64,61 @@ class OutlookConfigTest(unittest.TestCase):
         self.assertIn("prompt=select_account", url)
         self.assertIn("state=state-value", url)
 
+    def test_list_inbox_messages_uses_since_filter_and_paginates(self) -> None:
+        class RecordingClient(OutlookGraphClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    OutlookConfig(
+                        client_id="abc-123",
+                        tenant_id="common",
+                        scopes="offline_access User.Read Mail.Read",
+                    )
+                )
+                self.paths: list[str] = []
+
+            def _get_graph(self, path: str, token: dict[str, str]) -> dict[str, object]:
+                self.paths.append(path)
+                if len(self.paths) == 1:
+                    return {
+                        "value": [
+                            {
+                                "id": "message-1",
+                                "subject": "Invoice",
+                                "from": {"emailAddress": {"address": "billing@example.com"}},
+                                "receivedDateTime": "2026-06-09T12:00:00Z",
+                                "bodyPreview": "Preview",
+                                "body": {"content": "<p>Hello</p>"},
+                            }
+                        ],
+                        "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages?page=2",
+                    }
+                return {
+                    "value": [
+                        {
+                            "id": "message-2",
+                            "subject": "Receipt",
+                            "from": {"emailAddress": {"name": "Vendor"}},
+                            "receivedDateTime": "2026-06-09T12:01:00Z",
+                            "bodyPreview": "Preview 2",
+                            "body": {"content": "<p>World</p>"},
+                        }
+                    ]
+                }
+
+        client = RecordingClient()
+        messages = client.list_inbox_messages(
+            token={"access_token": "token"},
+            top=75,
+            received_since="2026-06-09T11:50:00Z",
+        )
+
+        self.assertEqual([message.id for message in messages], ["message-1", "message-2"])
+        first_query = parse_qs(urlparse(client.paths[0]).query)
+        self.assertEqual(first_query["$top"], ["50"])
+        self.assertEqual(first_query["$orderby"], ["receivedDateTime desc"])
+        self.assertEqual(first_query["$filter"], ["receivedDateTime ge 2026-06-09T11:50:00Z"])
+        self.assertEqual(client.paths[1], "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages?page=2")
+
     def test_save_outlook_settings_updates_client_and_tenant(self) -> None:
         original = storage.get_connector_settings("outlook")
         try:
@@ -105,6 +169,21 @@ class OutlookConfigTest(unittest.TestCase):
 
             capped = save_mail_poll_settings({"interval_minutes": "2000"})
             self.assertEqual(capped["interval_minutes"], 1440)
+        finally:
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
+
+    def test_mail_fetch_cursor_uses_overlap_window(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            save_mail_poll_settings({"interval_minutes": "5"})
+            status = update_mail_fetch_cursor(datetime(2026, 6, 9, 12, 0, tzinfo=UTC))
+
+            self.assertEqual(status["last_successful_fetch_at"], "2026-06-09T12:00:00+00:00")
+            self.assertEqual(mail_fetch_since_from_cursor(), "2026-06-09T11:50:00Z")
+            self.assertEqual(mail_poll_settings()["interval_minutes"], 5)
         finally:
             if original is not None:
                 storage.save_connector_settings("mail_poll", original)

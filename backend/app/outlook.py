@@ -202,17 +202,29 @@ class OutlookGraphClient:
             refreshed["refresh_token"] = refresh_token
         return self._with_expiry(refreshed)
 
-    def list_inbox_messages(self, token: dict[str, Any], top: int = 10) -> list[OutlookMessage]:
-        safe_top = max(1, min(top, 25))
-        query = urlencode(
-            {
-                "$top": str(safe_top),
-                "$select": "id,subject,from,receivedDateTime,bodyPreview,body",
-                "$orderby": "receivedDateTime desc",
-            }
-        )
-        response = self._get_graph(f"/me/mailFolders/Inbox/messages?{query}", token)
-        return [self._parse_message(item) for item in response.get("value", [])]
+    def list_inbox_messages(
+        self,
+        token: dict[str, Any],
+        top: int = 100,
+        received_since: str | None = None,
+    ) -> list[OutlookMessage]:
+        max_results = max(1, min(top, 500))
+        page_size = min(max_results, 50)
+        query_params = {
+            "$top": str(page_size),
+            "$select": "id,subject,from,receivedDateTime,bodyPreview,body",
+            "$orderby": "receivedDateTime desc",
+        }
+        if received_since:
+            query_params["$filter"] = f"receivedDateTime ge {received_since}"
+        query = urlencode(query_params)
+        path_or_url = f"/me/mailFolders/Inbox/messages?{query}"
+        messages: list[OutlookMessage] = []
+        while path_or_url and len(messages) < max_results:
+            response = self._get_graph(path_or_url, token)
+            messages.extend(self._parse_message(item) for item in response.get("value", []))
+            path_or_url = response.get("@odata.nextLink")
+        return messages[:max_results]
 
     def list_file_attachments(
         self,
@@ -282,8 +294,9 @@ class OutlookGraphClient:
         )
 
     def _get_graph(self, path: str, token: dict[str, Any]) -> dict[str, Any]:
+        url = path if path.startswith("https://") else f"{GRAPH_ROOT}{path}"
         request = Request(
-            f"{GRAPH_ROOT}{path}",
+            url,
             headers={
                 "Authorization": f"Bearer {token['access_token']}",
                 "Accept": "application/json",

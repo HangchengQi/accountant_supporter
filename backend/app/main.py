@@ -7,7 +7,7 @@ import os
 import secrets
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +34,7 @@ from .zoho import DryRunZohoBooksClient, ZohoConfig, ZohoOAuthClient
 
 
 ZOHO_BOOKS_API_ROOT = "https://www.zohoapis.com/books/v3"
+MAIL_FETCH_CURSOR_OVERLAP_MINUTES = 10
 
 
 def get_database_path() -> str:
@@ -402,15 +403,41 @@ def mail_poll_settings() -> dict[str, Any]:
     return {
         "interval_minutes": interval,
         "enabled": interval > 0,
+        "last_successful_fetch_at": settings.get("last_successful_fetch_at"),
         "saved_locally": bool(settings),
     }
 
 
 def save_mail_poll_settings(data: dict[str, Any]) -> dict[str, Any]:
+    settings = storage.get_connector_settings("mail_poll") or {}
     interval = float(data.get("interval_minutes", 0))
     interval = max(0.0, min(1440.0, interval))
-    storage.save_connector_settings("mail_poll", {"interval_minutes": interval})
+    settings["interval_minutes"] = interval
+    storage.save_connector_settings("mail_poll", settings)
     return mail_poll_settings()
+
+
+def update_mail_fetch_cursor(fetched_at: datetime | None = None) -> dict[str, Any]:
+    settings = storage.get_connector_settings("mail_poll") or {}
+    fetched_at = fetched_at or datetime.now(UTC)
+    settings["last_successful_fetch_at"] = fetched_at.isoformat()
+    storage.save_connector_settings("mail_poll", settings)
+    return mail_poll_settings()
+
+
+def mail_fetch_since_from_cursor() -> str | None:
+    settings = storage.get_connector_settings("mail_poll") or {}
+    cursor = settings.get("last_successful_fetch_at")
+    if not cursor:
+        return None
+    try:
+        cursor_dt = datetime.fromisoformat(str(cursor).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if cursor_dt.tzinfo is None:
+        cursor_dt = cursor_dt.replace(tzinfo=UTC)
+    since = cursor_dt.astimezone(UTC) - timedelta(minutes=MAIL_FETCH_CURSOR_OVERLAP_MINUTES)
+    return since.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def save_log_settings(data: dict[str, Any]) -> dict[str, Any]:
@@ -773,17 +800,27 @@ def get_outlook_token() -> dict[str, Any]:
     return token
 
 
-def list_outlook_messages(top: int = 10) -> list[dict[str, Any]]:
+def list_outlook_messages(top: int = 100) -> list[dict[str, Any]]:
     token = get_outlook_token()
     return [
         message.to_dict()
-        for message in get_outlook_client().list_inbox_messages(token=token, top=top)
+        for message in get_outlook_client().list_inbox_messages(
+            token=token,
+            top=top,
+            received_since=mail_fetch_since_from_cursor(),
+        )
     ]
 
 
-def ingest_outlook_messages(top: int = 10) -> dict[str, Any]:
+def ingest_outlook_messages(top: int = 100) -> dict[str, Any]:
     token = get_outlook_token()
-    messages = get_outlook_client().list_inbox_messages(token=token, top=top)
+    received_since = mail_fetch_since_from_cursor()
+    fetched_at = datetime.now(UTC)
+    messages = get_outlook_client().list_inbox_messages(
+        token=token,
+        top=top,
+        received_since=received_since,
+    )
     ingested: list[dict[str, Any]] = []
     for message in messages:
         stored = storage.save_mail_message(
@@ -801,7 +838,13 @@ def ingest_outlook_messages(top: int = 10) -> dict[str, Any]:
         item["classification_status"] = stored.classification_status
         item["classification_job_id"] = job.id
         ingested.append(item)
-    return {"messages": ingested, "ingested": len(ingested)}
+    poll_settings = update_mail_fetch_cursor(fetched_at)
+    return {
+        "messages": ingested,
+        "ingested": len(ingested),
+        "received_since": received_since,
+        "last_successful_fetch_at": poll_settings["last_successful_fetch_at"],
+    }
 
 
 def run_jobs(max_jobs: int = 10) -> dict[str, Any]:
@@ -1480,7 +1523,7 @@ def processing_page() -> str:
         }}
 
         async function fetchInboxIntoQueue() {{
-          const response = await fetch('/api/outlook/messages?top=5');
+          const response = await fetch('/api/outlook/messages?top=100');
           const result = await response.json();
           if (!response.ok) {{
             document.getElementById('outlook-messages').textContent = result.error || 'Unable to fetch messages';
@@ -1576,7 +1619,7 @@ def processing_page() -> str:
             const fetched = await fetchInboxIntoQueue();
             const queued = await runQueue();
             status.textContent =
-              `Auto-fetch complete: ingested ${{fetched.ingested || 0}}, completed ${{queued.completed || 0}} jobs.`;
+              `Auto-fetch complete: ingested ${{fetched.ingested || 0}}, completed ${{queued.completed || 0}} jobs. Cursor updated.`;
           }} catch (error) {{
             status.textContent = error.message || 'Auto-fetch failed.';
           }} finally {{
@@ -1890,13 +1933,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             )
 
     def _send_outlook_messages(self) -> None:
-        query = urlparse(self.path).query
-        top = 10
-        if query.startswith("top="):
-            try:
-                top = int(query.split("=", 1)[1])
-            except ValueError:
-                top = 10
+        query = parse_qs(urlparse(self.path).query)
+        top = 100
+        try:
+            top = int(query.get("top", ["100"])[0])
+        except ValueError:
+            top = 100
         try:
             self._send_json(ingest_outlook_messages(top=top))
         except Exception as exc:
