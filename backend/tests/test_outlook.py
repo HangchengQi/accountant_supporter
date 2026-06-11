@@ -183,7 +183,7 @@ class OutlookConfigTest(unittest.TestCase):
     def test_mail_poll_worker_start_and_stop_controls_lifecycle(self) -> None:
         original = storage.get_connector_settings("mail_poll")
         try:
-            save_mail_poll_settings({"interval_minutes": "5"})
+            save_mail_poll_settings({"interval_minutes": "5", "mail_provider": "outlook"})
             with patch("app.main.is_outlook_configured", return_value=True):
                 started = start_mail_poll_worker()
 
@@ -204,7 +204,7 @@ class OutlookConfigTest(unittest.TestCase):
     def test_mail_poll_worker_start_requires_outlook_configuration(self) -> None:
         original = storage.get_connector_settings("mail_poll")
         try:
-            save_mail_poll_settings({"interval_minutes": "5"})
+            save_mail_poll_settings({"interval_minutes": "5", "mail_provider": "outlook"})
             with patch("app.main.is_outlook_configured", return_value=False):
                 with self.assertRaises(ValueError):
                     start_mail_poll_worker()
@@ -223,7 +223,7 @@ class OutlookConfigTest(unittest.TestCase):
     def test_mail_fetch_cursor_uses_overlap_window(self) -> None:
         original = storage.get_connector_settings("mail_poll")
         try:
-            save_mail_poll_settings({"interval_minutes": "5"})
+            save_mail_poll_settings({"interval_minutes": "5", "mail_provider": "outlook"})
             status = update_mail_fetch_cursor(datetime(2026, 6, 9, 12, 0, tzinfo=UTC))
 
             self.assertEqual(status["last_successful_fetch_at"], "2026-06-09T12:00:00+00:00")
@@ -238,7 +238,7 @@ class OutlookConfigTest(unittest.TestCase):
     def test_mail_poll_worker_reports_waiting_for_outlook(self) -> None:
         original = storage.get_connector_settings("mail_poll")
         try:
-            save_mail_poll_settings({"interval_minutes": "5"})
+            save_mail_poll_settings({"interval_minutes": "5", "mail_provider": "outlook"})
             with patch("app.main.get_outlook_token", side_effect=ValueError("Outlook is not connected")):
                 result = run_mail_poll_worker_once()
 

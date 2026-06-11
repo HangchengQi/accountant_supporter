@@ -1326,69 +1326,79 @@ def index() -> str:
         <section class="connection-card">
           <div class="connector-head">
             <div>
-              <h2>Mail Authentication</h2>
+              <h2>Mail Register</h2>
               <p>Connect Outlook or Gmail so the app can read selected mailbox messages for summarization.</p>
             </div>
-            <span class="pill" id="outlook-pill">Checking</span>
+            <span class="pill" id="mail-register-pill">Mail</span>
           </div>
-          <label for="outlook-account-type">Outlook Account Type</label>
-          <select id="outlook-account-type">
-            <option value="personal">Personal Outlook account</option>
-            <option value="common">Microsoft app: work, school, or personal</option>
-            <option value="organizations">Microsoft app: work or school only</option>
-            <option value="custom">Microsoft app: specific business tenant</option>
+          <label for="mail-provider">Mail Provider</label>
+          <select id="mail-provider">
+            <option value="outlook">Outlook</option>
+            <option value="gmail">Gmail</option>
           </select>
-          <div class="notice" id="outlook-mode-note"></div>
-          <div class="toolbar" id="outlook-connect-toolbar">
-            <button type="button" id="outlook-device-connect">Connect Outlook</button>
-            <a class="button-link secondary" id="outlook-redirect-connect" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Redirect sign-in</a>
-          </div>
-          <div class="notice" id="outlook-personal-action" style="display:none"></div>
-          <div class="status" id="outlook-status">Checking status...</div>
-          <div class="notice" id="outlook-config"></div>
-          <div class="notice" id="outlook-device-code" style="display:none"></div>
-          <div id="outlook-app-fields">
-            <label for="outlook-client-id">Microsoft App Client ID</label>
-            <input id="outlook-client-id" autocomplete="off" placeholder="Application (client) ID from app registration" />
-            <label for="outlook-tenant-id">Tenant or Login Audience</label>
-            <input id="outlook-tenant-id" autocomplete="off" placeholder="common or tenant ID" />
-            <div class="toolbar">
-              <button class="secondary" type="button" id="outlook-save">Save Outlook settings</button>
-            </div>
-          </div>
-          <div class="status" id="outlook-save-status"></div>
 
-          <div class="history-head">
-            <h2>Gmail Authentication</h2>
-            <p>Connect Gmail so the app can read bill messages from a Gmail inbox.</p>
-          </div>
-          <div class="connector-head">
-            <div>
-              <label for="mail-provider">Mail Provider Used By Fetcher</label>
-              <select id="mail-provider">
-                <option value="outlook">Outlook</option>
-                <option value="gmail">Gmail</option>
-              </select>
+          <div id="outlook-register-panel">
+            <div class="connector-head">
+              <div>
+                <h2>Outlook Authentication</h2>
+                <p>Connect Outlook so the app can read bill messages from an Outlook inbox.</p>
+              </div>
+              <span class="pill" id="outlook-pill">Checking</span>
             </div>
-            <span class="pill" id="gmail-pill">Checking</span>
+            <label for="outlook-account-type">Outlook Account Type</label>
+            <select id="outlook-account-type">
+              <option value="personal">Personal Outlook account</option>
+              <option value="common">Microsoft app: work, school, or personal</option>
+              <option value="organizations">Microsoft app: work or school only</option>
+              <option value="custom">Microsoft app: specific business tenant</option>
+            </select>
+            <div class="notice" id="outlook-mode-note"></div>
+            <div class="toolbar" id="outlook-connect-toolbar">
+              <button type="button" id="outlook-device-connect">Connect Outlook</button>
+              <a class="button-link secondary" id="outlook-redirect-connect" href="/auth/outlook/start" target="_blank" rel="noopener noreferrer">Redirect sign-in</a>
+            </div>
+            <div class="notice" id="outlook-personal-action" style="display:none"></div>
+            <div class="status" id="outlook-status">Checking status...</div>
+            <div class="notice" id="outlook-config"></div>
+            <div class="notice" id="outlook-device-code" style="display:none"></div>
+            <div id="outlook-app-fields">
+              <label for="outlook-client-id">Microsoft App Client ID</label>
+              <input id="outlook-client-id" autocomplete="off" placeholder="Application (client) ID from app registration" />
+              <label for="outlook-tenant-id">Tenant or Login Audience</label>
+              <input id="outlook-tenant-id" autocomplete="off" placeholder="common or tenant ID" />
+              <div class="toolbar">
+                <button class="secondary" type="button" id="outlook-save">Save Outlook settings</button>
+              </div>
+            </div>
+            <div class="status" id="outlook-save-status"></div>
           </div>
-          <div class="toolbar">
-            <a class="button-link" id="gmail-connect" href="/auth/gmail/start" target="_blank" rel="noopener noreferrer">Connect Gmail</a>
+
+          <div id="gmail-register-panel">
+            <div class="connector-head">
+              <div>
+                <h2>Gmail Authentication</h2>
+                <p>Connect Gmail so the app can read bill messages from a Gmail inbox.</p>
+              </div>
+              <span class="pill" id="gmail-pill">Checking</span>
+            </div>
+            <div class="toolbar">
+              <a class="button-link" id="gmail-connect" href="/auth/gmail/start" target="_blank" rel="noopener noreferrer">Connect Gmail</a>
+            </div>
+            <div class="status" id="gmail-status">Checking Gmail status...</div>
+            <div class="notice" id="gmail-config"></div>
+            <label for="gmail-client-id">Google OAuth Client ID</label>
+            <input id="gmail-client-id" autocomplete="off" placeholder="Google Cloud OAuth client ID" />
+            <label for="gmail-client-secret">Google OAuth Client Secret</label>
+            <input id="gmail-client-secret" type="password" autocomplete="off" placeholder="Paste secret to save or rotate" />
+            <label for="gmail-redirect-uri">Gmail Redirect URI</label>
+            <input id="gmail-redirect-uri" autocomplete="off" placeholder="http://127.0.0.1:8080/auth/gmail/callback" />
+            <label for="gmail-scopes">Gmail Scopes</label>
+            <input id="gmail-scopes" autocomplete="off" placeholder="https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send" />
+            <div class="toolbar">
+              <button class="secondary" type="button" id="gmail-save">Save Gmail settings</button>
+            </div>
+            <div class="status" id="gmail-save-status"></div>
           </div>
-          <div class="status" id="gmail-status">Checking Gmail status...</div>
-          <div class="notice" id="gmail-config"></div>
-          <label for="gmail-client-id">Google OAuth Client ID</label>
-          <input id="gmail-client-id" autocomplete="off" placeholder="Google Cloud OAuth client ID" />
-          <label for="gmail-client-secret">Google OAuth Client Secret</label>
-          <input id="gmail-client-secret" type="password" autocomplete="off" placeholder="Paste secret to save or rotate" />
-          <label for="gmail-redirect-uri">Gmail Redirect URI</label>
-          <input id="gmail-redirect-uri" autocomplete="off" placeholder="http://127.0.0.1:8080/auth/gmail/callback" />
-          <label for="gmail-scopes">Gmail Scopes</label>
-          <input id="gmail-scopes" autocomplete="off" placeholder="https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send" />
-          <div class="toolbar">
-            <button class="secondary" type="button" id="gmail-save">Save Gmail settings</button>
-          </div>
-          <div class="status" id="gmail-save-status"></div>
         </section>
 
         <section class="connection-card">
@@ -1666,9 +1676,11 @@ def index() -> str:
           const response = await fetch('/api/mail-poll/settings');
           const settings = await response.json();
           document.getElementById('mail-provider').value = settings.mail_provider || 'outlook';
+          syncMailRegisterMode();
         }
 
         document.getElementById('mail-provider').addEventListener('change', async () => {
+          syncMailRegisterMode();
           const response = await fetch('/api/mail-poll/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1676,6 +1688,13 @@ def index() -> str:
           });
           await response.json();
         });
+
+        function syncMailRegisterMode() {
+          const provider = document.getElementById('mail-provider').value;
+          document.getElementById('outlook-register-panel').style.display = provider === 'outlook' ? 'block' : 'none';
+          document.getElementById('gmail-register-panel').style.display = provider === 'gmail' ? 'block' : 'none';
+          document.getElementById('mail-register-pill').textContent = provider === 'gmail' ? 'Gmail' : 'Outlook';
+        }
 
         document.getElementById('gmail-save').addEventListener('click', async () => {
           const response = await fetch('/api/gmail/settings', {
