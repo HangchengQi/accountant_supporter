@@ -1329,7 +1329,10 @@ def index() -> str:
               <h2>Mail Register</h2>
               <p>Connect Outlook or Gmail so the app can read selected mailbox messages for summarization.</p>
             </div>
-            <span class="pill" id="mail-register-pill">Mail</span>
+            <div class="pill-stack">
+              <span class="pill" id="mail-register-pill">Mail</span>
+              <span class="pill" id="mail-connected-pill">Checking</span>
+            </div>
           </div>
           <label for="mail-provider">Mail Provider</label>
           <select id="mail-provider">
@@ -1489,6 +1492,11 @@ def index() -> str:
         </section>
       </main>
       <script>
+        const mailConnectionState = {
+          outlook: { configured: false, connected: false },
+          gmail: { configured: false, connected: false }
+        };
+
         async function refreshConnectionStatus() {
           await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshApprovalSettings()]);
         }
@@ -1499,6 +1507,11 @@ def index() -> str:
           const target = document.getElementById('outlook-status');
           const pill = document.getElementById('outlook-pill');
           const config = document.getElementById('outlook-config');
+          mailConnectionState.outlook = {
+            configured: Boolean(status.configured),
+            connected: Boolean(status.connected)
+          };
+          updateMailRegisterAnnotation();
           document.getElementById('outlook-client-id').value = status.settings?.client_id || '';
           document.getElementById('outlook-account-type').value =
             status.configured ? (status.settings?.account_type || 'common') : 'personal';
@@ -1642,6 +1655,11 @@ def index() -> str:
           const pill = document.getElementById('gmail-pill');
           const config = document.getElementById('gmail-config');
           const connect = document.getElementById('gmail-connect');
+          mailConnectionState.gmail = {
+            configured: Boolean(status.configured),
+            connected: Boolean(status.connected)
+          };
+          updateMailRegisterAnnotation();
           document.getElementById('gmail-client-id').value = status.settings?.client_id || '';
           document.getElementById('gmail-client-secret').value = '';
           document.getElementById('gmail-redirect-uri').value =
@@ -1693,7 +1711,28 @@ def index() -> str:
           const provider = document.getElementById('mail-provider').value;
           document.getElementById('outlook-register-panel').style.display = provider === 'outlook' ? 'block' : 'none';
           document.getElementById('gmail-register-panel').style.display = provider === 'gmail' ? 'block' : 'none';
-          document.getElementById('mail-register-pill').textContent = provider === 'gmail' ? 'Gmail' : 'Outlook';
+          updateMailRegisterAnnotation();
+        }
+
+        function updateMailRegisterAnnotation() {
+          const provider = document.getElementById('mail-provider').value;
+          const providerPill = document.getElementById('mail-register-pill');
+          const connectedPill = document.getElementById('mail-connected-pill');
+          const providerLabel = provider === 'gmail' ? 'Gmail' : 'Outlook';
+          const state = mailConnectionState[provider] || { configured: false, connected: false };
+          providerPill.textContent = providerLabel;
+          if (state.connected) {
+            connectedPill.textContent = 'Mail connected';
+            connectedPill.className = 'pill ok';
+            return;
+          }
+          if (state.configured) {
+            connectedPill.textContent = 'Mail configured';
+            connectedPill.className = 'pill';
+            return;
+          }
+          connectedPill.textContent = 'Mail not connected';
+          connectedPill.className = 'pill danger';
         }
 
         document.getElementById('gmail-save').addEventListener('click', async () => {
