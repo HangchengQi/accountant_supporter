@@ -41,6 +41,7 @@ MAIL_POLL_BATCH_SIZE = 100
 MAIL_POLL_QUEUE_BATCH_SIZE = 10
 QUEUE_DRAIN_BATCH_SIZE = 10
 QUEUE_DRAIN_INTERVAL_SECONDS = 15.0
+DAILY_LOG_CHECK_INTERVAL_SECONDS = 60.0
 MAIL_FETCH_NOT_BEFORE_KEY = "fetch_not_before_at"
 
 
@@ -140,29 +141,13 @@ def _handle_billing_artifacts(
     record: ProcessedEmail,
     attachments: list[BillAttachment],
 ) -> Any:
-    artifacts = save_billing_artifacts(
+    return save_billing_artifacts(
         message=message,
         processed=record,
         attachments=attachments,
         bills_root=get_bills_root(),
         logs_root=get_logs_root(),
     )
-    receiver = log_settings()["receiver_email"]
-    if receiver:
-        email_date = artifacts.daily_log.stem.replace("billing-log-", "", 1)
-        try:
-            token = get_gmail_token() if message.provider == "gmail" else get_outlook_token()
-            client = get_gmail_client() if message.provider == "gmail" else get_outlook_client()
-            client.send_mail(
-                token=token,
-                to_address=receiver,
-                subject=f"Daily billing log {email_date}",
-                body=artifacts.daily_log.read_text(encoding="utf-8"),
-            )
-        except Exception as exc:
-            with artifacts.daily_log.open("a", encoding="utf-8") as f:
-                f.write(f"- Log email send failed: {exc}\n\n")
-    return artifacts
 
 
 def _email_with_account_context(email: EmailSampleIn) -> EmailSampleIn:
@@ -440,6 +425,10 @@ def log_settings() -> dict[str, Any]:
     settings = storage.get_connector_settings("billing_log") or {}
     return {
         "receiver_email": settings.get("receiver_email", ""),
+        "send_time": normalize_log_send_time(settings.get("send_time", "17:00")),
+        "last_sent_date": settings.get("last_sent_date", ""),
+        "last_sent_at": settings.get("last_sent_at", ""),
+        "last_send_error": settings.get("last_send_error", ""),
         "saved_locally": bool(settings),
     }
 
@@ -666,11 +655,77 @@ def mail_fetch_since_from_cursor(provider: str | None = None) -> str | None:
 
 
 def save_log_settings(data: dict[str, Any]) -> dict[str, Any]:
+    existing = storage.get_connector_settings("billing_log") or {}
     receiver_email = str(data.get("receiver_email", "")).strip()
     if receiver_email and ("@" not in receiver_email or len(receiver_email) > 320):
         raise ValueError("receiver_email must be a valid email address")
-    storage.save_connector_settings("billing_log", {"receiver_email": receiver_email})
+    storage.save_connector_settings(
+        "billing_log",
+        {
+            **existing,
+            "receiver_email": receiver_email,
+            "send_time": normalize_log_send_time(data.get("send_time", existing.get("send_time", "17:00"))),
+        },
+    )
     return log_settings()
+
+
+def normalize_log_send_time(value: Any) -> str:
+    text = str(value or "17:00").strip()
+    try:
+        hour_text, minute_text = text.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("send_time must be in HH:MM format") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("send_time must be in HH:MM format")
+    return f"{hour:02d}:{minute:02d}"
+
+
+def send_daily_billing_log_if_due(now: datetime | None = None) -> dict[str, Any]:
+    settings = storage.get_connector_settings("billing_log") or {}
+    receiver = str(settings.get("receiver_email", "")).strip()
+    send_time = normalize_log_send_time(settings.get("send_time", "17:00"))
+    now = now or datetime.now().astimezone()
+    today = now.date().isoformat()
+    if not receiver:
+        return {"status": "skipped", "reason": "receiver_not_configured"}
+    if settings.get("last_sent_date") == today:
+        return {"status": "skipped", "reason": "already_sent", "date": today}
+    scheduled_hour, scheduled_minute = (int(part) for part in send_time.split(":", 1))
+    scheduled = now.replace(hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0)
+    if now < scheduled:
+        return {"status": "skipped", "reason": "not_due", "date": today, "send_time": send_time}
+
+    log_path = Path(get_logs_root()) / f"billing-log-{today}.md"
+    if not log_path.exists():
+        settings["last_send_error"] = ""
+        storage.save_connector_settings("billing_log", settings)
+        return {"status": "skipped", "reason": "log_not_found", "date": today}
+
+    provider = active_mail_provider()
+    try:
+        token = get_gmail_token() if provider == "gmail" else get_outlook_token()
+        client = get_gmail_client() if provider == "gmail" else get_outlook_client()
+        client.send_mail(
+            token=token,
+            to_address=receiver,
+            subject=f"Daily billing log {today}",
+            body=log_path.read_text(encoding="utf-8"),
+        )
+    except Exception as exc:
+        settings["last_send_error"] = str(exc)
+        storage.save_connector_settings("billing_log", settings)
+        return {"status": "failed", "error": str(exc), "date": today}
+
+    sent_at = now.isoformat()
+    settings["send_time"] = send_time
+    settings["last_sent_date"] = today
+    settings["last_sent_at"] = sent_at
+    settings["last_send_error"] = ""
+    storage.save_connector_settings("billing_log", settings)
+    return {"status": "sent", "date": today, "sent_at": sent_at}
 
 
 def _should_auto_upload(extracted: ExtractedFields, settings: dict[str, Any]) -> bool:
@@ -1218,6 +1273,7 @@ class MailPollWorker(threading.Thread):
         self.stop_event = stop_event
         self.next_fetch_at = 0.0
         self.next_queue_drain_at = 0.0
+        self.next_daily_log_check_at = 0.0
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -1226,6 +1282,7 @@ class MailPollWorker(threading.Thread):
             if interval_minutes <= 0:
                 self.next_fetch_at = 0.0
                 self.next_queue_drain_at = 0.0
+                self.next_daily_log_check_at = 0.0
                 self.stop_event.wait(5)
                 continue
 
@@ -1245,9 +1302,17 @@ class MailPollWorker(threading.Thread):
                 self.next_queue_drain_at = time.time() + QUEUE_DRAIN_INTERVAL_SECONDS
                 ran_work = True
 
+            now = time.time()
+            if not self.next_daily_log_check_at or now >= self.next_daily_log_check_at:
+                send_daily_billing_log_if_due()
+                self.next_daily_log_check_at = time.time() + DAILY_LOG_CHECK_INTERVAL_SECONDS
+                ran_work = True
+
             if not ran_work:
                 next_run_at = min(
-                    value for value in [self.next_fetch_at, self.next_queue_drain_at] if value
+                    value
+                    for value in [self.next_fetch_at, self.next_queue_drain_at, self.next_daily_log_check_at]
+                    if value
                 )
                 self.stop_event.wait(max(0.5, min(5.0, next_run_at - time.time())))
 
@@ -1571,8 +1636,10 @@ def index() -> str:
           </div>
           <label for="log-receiver">Log Receiver</label>
           <input id="log-receiver" type="email" autocomplete="off" placeholder="billing-log@example.com" />
+          <label for="log-send-time">Daily Send Time</label>
+          <input id="log-send-time" type="time" />
           <div class="toolbar">
-            <button class="secondary" type="button" id="log-save">Save log receiver</button>
+            <button class="secondary" type="button" id="log-save">Save daily log settings</button>
           </div>
           <div class="status" id="log-status">Daily billing log receiver is not set.</div>
         </section>
@@ -1985,11 +2052,17 @@ def index() -> str:
           const settings = await response.json();
           const pill = document.getElementById('log-pill');
           document.getElementById('log-receiver').value = settings.receiver_email || '';
+          document.getElementById('log-send-time').value = settings.send_time || '17:00';
           pill.textContent = settings.receiver_email ? 'Configured' : 'Not set';
           pill.className = settings.receiver_email ? 'pill ok' : 'pill';
-          document.getElementById('log-status').textContent = settings.receiver_email
-            ? `Daily billing logs will be sent to ${settings.receiver_email}.`
-            : 'Daily billing log receiver is not set.';
+          if (!settings.receiver_email) {
+            document.getElementById('log-status').textContent = 'Daily billing log receiver is not set.';
+            return;
+          }
+          const lastSent = settings.last_sent_at ? ` Last sent: ${settings.last_sent_at}.` : '';
+          const sendError = settings.last_send_error ? ` Last send error: ${settings.last_send_error}.` : '';
+          document.getElementById('log-status').textContent =
+            `Daily billing logs will be sent once per day to ${settings.receiver_email} at ${settings.send_time || '17:00'}.${lastSent}${sendError}`;
         }
 
         document.getElementById('log-save').addEventListener('click', async () => {
@@ -1997,7 +2070,8 @@ def index() -> str:
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              receiver_email: document.getElementById('log-receiver').value
+              receiver_email: document.getElementById('log-receiver').value,
+              send_time: document.getElementById('log-send-time').value
             })
           });
           const result = await response.json();
