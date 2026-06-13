@@ -1,7 +1,10 @@
 import unittest
+from datetime import UTC, datetime
+from unittest.mock import patch
 
 from app.ai import LocalHeuristicProcessor
-from app.schemas import EmailSampleIn
+from app.main import _initial_zoho_state, process_mail_message, render_record
+from app.schemas import EmailSampleIn, ExtractedFields, MailMessage, ProcessedEmail
 from app.workflow import Workflow
 
 
@@ -29,6 +32,77 @@ class LocalProcessorTest(unittest.TestCase):
         self.assertEqual(result.extracted.invoice_number, "INV-1042")
         self.assertEqual(result.extracted.amount, 842.15)
         self.assertTrue(result.extracted.needs_review)
+
+    def test_irrelevant_extraction_is_not_pending_approval(self) -> None:
+        status, payload = _initial_zoho_state(
+            ExtractedFields(
+                category="irrelevant",
+                confidence=0.98,
+                needs_review=False,
+            )
+        )
+
+        self.assertEqual(status, "not_bill")
+        self.assertIn("not bill-relevant", payload["approval_reason"])
+
+    def test_process_mail_message_does_not_save_billing_artifacts_for_irrelevant_email(self) -> None:
+        message = MailMessage(
+            id=1,
+            provider="gmail",
+            provider_message_id="message-1",
+            received_at="2026-06-13T12:00:00Z",
+            subject="Promotional email",
+            sender="Promo <promo@example.com>",
+            body_preview="Sale",
+            body="Sale",
+            classification_status="relevant",
+            classification_category="invoice",
+            classification_confidence=0.9,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        processed = ProcessedEmail(
+            id=1,
+            created_at=datetime.now(UTC),
+            subject="Promotional email",
+            sender="Promo <promo@example.com>",
+            summary="Promotional email.",
+            extracted=ExtractedFields(category="irrelevant", confidence=0.98, needs_review=False),
+            workflow_name="vendor_invoice_email",
+            workflow_version=1,
+            zoho_status="not_bill",
+            zoho_payload={},
+        )
+
+        with (
+            patch("app.main._list_bill_attachments", return_value=[]),
+            patch("app.main.process_email_sample", return_value=processed),
+            patch("app.main._handle_billing_artifacts") as artifacts,
+        ):
+            result = process_mail_message(message)
+
+        self.assertEqual(result.zoho_status, "not_bill")
+        artifacts.assert_not_called()
+
+    def test_irrelevant_pending_record_renders_without_approval_actions(self) -> None:
+        record = ProcessedEmail(
+            id=1,
+            created_at=datetime.now(UTC),
+            subject="Promotional email",
+            sender="Promo <promo@example.com>",
+            summary="Promotional email.",
+            extracted=ExtractedFields(category="irrelevant", confidence=0.98, needs_review=True),
+            workflow_name="vendor_invoice_email",
+            workflow_version=1,
+            zoho_status="pending_approval",
+            zoho_payload={"approval_reason": "Old pending record"},
+        )
+
+        html = render_record(record)
+
+        self.assertIn("Not bill-relevant", html)
+        self.assertIn("Extraction confidence", html)
+        self.assertNotIn("Approve and upload to Zoho", html)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ QUEUE_DRAIN_BATCH_SIZE = 10
 QUEUE_DRAIN_INTERVAL_SECONDS = 15.0
 DAILY_LOG_CHECK_INTERVAL_SECONDS = 60.0
 MAIL_FETCH_NOT_BEFORE_KEY = "fetch_not_before_at"
+BILL_RELEVANT_CATEGORIES = {"invoice", "receipt", "statement"}
 
 
 def get_database_path() -> str:
@@ -103,7 +104,7 @@ def process_mail_message(message: MailMessage) -> ProcessedEmail:
         attachments = _list_bill_attachments(message)
         email = _email_with_attachment_context(email, attachments)
     record = process_email_sample(email)
-    if message.provider in {"outlook", "gmail"}:
+    if message.provider in {"outlook", "gmail"} and _is_bill_relevant_category(record.extracted.category):
         artifacts = _handle_billing_artifacts(message, record, attachments)
         record = _finalize_processed_email(record, artifacts.saved_files)
     return record
@@ -160,6 +161,15 @@ def _email_with_account_context(email: EmailSampleIn) -> EmailSampleIn:
 
 def _initial_zoho_state(extracted: ExtractedFields) -> tuple[str, dict[str, Any]]:
     settings = approval_settings()
+    if not _is_bill_relevant_category(extracted.category):
+        return (
+            "not_bill",
+            {
+                "approval_reason": f"Category {extracted.category} is not bill-relevant.",
+                "approval_settings": settings,
+                "saved_files": [],
+            },
+        )
     return (
         "pending_approval",
         {
@@ -171,6 +181,13 @@ def _initial_zoho_state(extracted: ExtractedFields) -> tuple[str, dict[str, Any]
 
 
 def _finalize_processed_email(record: ProcessedEmail, saved_files: list[Path]) -> ProcessedEmail:
+    if not _is_bill_relevant_category(record.extracted.category):
+        payload = dict(record.zoho_payload)
+        payload["saved_files"] = [str(path) for path in saved_files]
+        payload["approval_reason"] = f"Category {record.extracted.category} is not bill-relevant."
+        storage.update_processed_email_zoho(record.id, "not_bill", payload)
+        refreshed = storage.get_processed_email(record.id)
+        return refreshed or record
     payload = dict(record.zoho_payload)
     payload["saved_files"] = [str(path) for path in saved_files]
     settings = approval_settings()
@@ -729,6 +746,8 @@ def send_daily_billing_log_if_due(now: datetime | None = None) -> dict[str, Any]
 
 
 def _should_auto_upload(extracted: ExtractedFields, settings: dict[str, Any]) -> bool:
+    if not _is_bill_relevant_category(extracted.category):
+        return False
     if settings["manual_approval_required"]:
         return False
     if not extracted.expense_account_name:
@@ -739,6 +758,8 @@ def _should_auto_upload(extracted: ExtractedFields, settings: dict[str, Any]) ->
 
 
 def _approval_reason(extracted: ExtractedFields, settings: dict[str, Any]) -> str:
+    if not _is_bill_relevant_category(extracted.category):
+        return f"Category {extracted.category} is not bill-relevant."
     if settings["manual_approval_required"]:
         return "Manual approval is required by settings."
     if not extracted.expense_account_name:
@@ -751,6 +772,10 @@ def _approval_reason(extracted: ExtractedFields, settings: dict[str, Any]) -> st
             f"threshold {settings['account_confidence_threshold']:.2f}."
         )
     return "Ready for automatic upload."
+
+
+def _is_bill_relevant_category(category: str | None) -> bool:
+    return str(category or "").strip().lower() in BILL_RELEVANT_CATEGORIES
 
 
 def get_zoho_token() -> dict[str, Any]:
@@ -2121,7 +2146,12 @@ def index() -> str:
 
 def processing_page() -> str:
     records = storage.list_processed_emails()
-    pending_records = [record for record in records if record.zoho_status in {"pending_approval", "upload_failed"}]
+    pending_records = [
+        record
+        for record in records
+        if record.zoho_status in {"pending_approval", "upload_failed"}
+        and _is_bill_relevant_category(record.extracted.category)
+    ]
     history_records = [record for record in records if record.zoho_status not in {"pending_approval", "upload_failed"}]
     pending_items = "\n".join(render_record(record, section="pending") for record in pending_records)
     history_items = "\n".join(render_record(record, section="history") for record in history_records)
@@ -2187,6 +2217,7 @@ def processing_page() -> str:
                 <option value="automated_submission">Automated submission</option>
                 <option value="manual_submission">Manual submission</option>
                 <option value="failed">Failed submission</option>
+                <option value="not_bill">Not bill-relevant</option>
                 <option value="discarded">Discarded</option>
               </select>
             </div>
@@ -2798,14 +2829,14 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
 
 def render_record(record: ProcessedEmail, section: str = "history") -> str:
     extracted = record.extracted
-    review = '<span class="badge">Review required</span>' if extracted.needs_review else ""
+    review = '<span class="badge">Review required</span>' if extracted.needs_review and _is_bill_relevant_category(extracted.category) else ""
     approval = '<span class="badge">Approval pending</span>' if record.zoho_status in {"pending_approval", "upload_failed"} else ""
     amount = "" if extracted.amount is None else f"{extracted.currency or ''} {extracted.amount:,.2f}"
     account_confidence = f"{extracted.account_confidence:.2f}"
     status_group = _approval_status_group(record)
     status_label = _approval_status_label(record)
     actions = ""
-    if record.zoho_status in {"pending_approval", "upload_failed"}:
+    if record.zoho_status in {"pending_approval", "upload_failed"} and _is_bill_relevant_category(extracted.category):
         reason = html.escape(str(record.zoho_payload.get("approval_reason") or record.zoho_payload.get("upload_error") or "Review required."))
         actions = f"""
           <div class="approval-actions" data-record-id="{record.id}">
@@ -2837,7 +2868,7 @@ def render_record(record: ProcessedEmail, section: str = "history") -> str:
           <dt>Invoice date</dt><dd>{html.escape(extracted.invoice_date or "")}</dd>
           <dt>Due date</dt><dd>{html.escape(extracted.due_date or "")}</dd>
           <dt>Amount</dt><dd>{html.escape(amount)}</dd>
-          <dt>Confidence</dt><dd>{extracted.confidence:.2f}</dd>
+          <dt>Extraction confidence</dt><dd>{extracted.confidence:.2f}</dd>
           <dt>Account</dt><dd>{html.escape(extracted.expense_account_name or "")}</dd>
           <dt>Account confidence</dt><dd>{html.escape(account_confidence)}</dd>
           <dt>Account reason</dt><dd>{html.escape(extracted.account_reason or "")}</dd>
@@ -2848,6 +2879,8 @@ def render_record(record: ProcessedEmail, section: str = "history") -> str:
 
 
 def _approval_status_group(record: ProcessedEmail) -> str:
+    if not _is_bill_relevant_category(record.extracted.category) or record.zoho_status == "not_bill":
+        return "not_bill"
     if record.zoho_status == "uploaded":
         reason = str(record.zoho_payload.get("approval_reason", ""))
         if reason or record.zoho_payload.get("reviewed_from_processed_email_id"):
@@ -2872,8 +2905,11 @@ def _approval_status_label(record: ProcessedEmail) -> str:
         "automated_submission": "Automated submission",
         "manual_submission": "Manual submission",
         "failed": "Failed submission",
+        "not_bill": "Not bill-relevant",
         "discarded": "Discarded",
     }
+    if record.zoho_status == "not_bill" or not _is_bill_relevant_category(record.extracted.category):
+        return "Not bill-relevant"
     if record.zoho_status == "pending_approval":
         return "Review required"
     if record.zoho_status == "upload_failed":
