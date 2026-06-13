@@ -39,6 +39,8 @@ ZOHO_BOOKS_API_ROOT = "https://www.zohoapis.com/books/v3"
 MAIL_FETCH_CURSOR_OVERLAP_MINUTES = 10
 MAIL_POLL_BATCH_SIZE = 100
 MAIL_POLL_QUEUE_BATCH_SIZE = 10
+QUEUE_DRAIN_BATCH_SIZE = 10
+QUEUE_DRAIN_INTERVAL_SECONDS = 15.0
 MAIL_FETCH_NOT_BEFORE_KEY = "fetch_not_before_at"
 
 
@@ -542,6 +544,9 @@ def mail_poll_settings() -> dict[str, Any]:
         "last_worker_error": settings.get("last_worker_error", ""),
         "last_worker_ingested": settings.get("last_worker_ingested", 0),
         "last_worker_completed_jobs": settings.get("last_worker_completed_jobs", 0),
+        "last_queue_drain_at": settings.get("last_queue_drain_at"),
+        "last_queue_drain_completed_jobs": settings.get("last_queue_drain_completed_jobs", 0),
+        "last_queue_drain_error": settings.get("last_queue_drain_error", ""),
         "saved_locally": bool(settings),
     }
 
@@ -624,6 +629,20 @@ def update_mail_poll_worker_status(
     settings["last_worker_error"] = error
     settings["last_worker_ingested"] = ingested
     settings["last_worker_completed_jobs"] = completed_jobs
+    storage.save_connector_settings("mail_poll", settings)
+    return mail_poll_settings()
+
+
+def update_queue_drain_status(
+    completed_jobs: int = 0,
+    error: str = "",
+    drained_at: datetime | None = None,
+) -> dict[str, Any]:
+    settings = storage.get_connector_settings("mail_poll") or {}
+    drained_at = drained_at or datetime.now(UTC)
+    settings["last_queue_drain_at"] = drained_at.isoformat()
+    settings["last_queue_drain_completed_jobs"] = completed_jobs
+    settings["last_queue_drain_error"] = error
     storage.save_connector_settings("mail_poll", settings)
     return mail_poll_settings()
 
@@ -1184,28 +1203,53 @@ def run_mail_poll_worker_once() -> dict[str, Any]:
         mail_poll_worker_lock.release()
 
 
+def run_queue_drain_once(max_jobs: int = QUEUE_DRAIN_BATCH_SIZE) -> dict[str, Any]:
+    queued = run_jobs(max_jobs=max_jobs)
+    update_queue_drain_status(
+        completed_jobs=int(queued.get("completed", 0)),
+        error="",
+    )
+    return queued
+
+
 class MailPollWorker(threading.Thread):
     def __init__(self, stop_event: threading.Event) -> None:
         super().__init__(daemon=True, name="mail-poll-worker")
         self.stop_event = stop_event
-        self.next_run_at = 0.0
+        self.next_fetch_at = 0.0
+        self.next_queue_drain_at = 0.0
 
     def run(self) -> None:
         while not self.stop_event.is_set():
             settings = mail_poll_settings()
             interval_minutes = float(settings.get("interval_minutes", 0) or 0)
             if interval_minutes <= 0:
-                self.next_run_at = 0.0
+                self.next_fetch_at = 0.0
+                self.next_queue_drain_at = 0.0
                 self.stop_event.wait(5)
                 continue
 
             now = time.time()
-            if self.next_run_at and now < self.next_run_at:
-                self.stop_event.wait(min(5, self.next_run_at - now))
-                continue
+            ran_work = False
+            if not self.next_fetch_at or now >= self.next_fetch_at:
+                run_mail_poll_worker_once()
+                self.next_fetch_at = time.time() + max(15.0, interval_minutes * 60)
+                ran_work = True
 
-            run_mail_poll_worker_once()
-            self.next_run_at = time.time() + max(15.0, interval_minutes * 60)
+            now = time.time()
+            if not self.next_queue_drain_at or now >= self.next_queue_drain_at:
+                try:
+                    run_queue_drain_once()
+                except Exception as exc:
+                    update_queue_drain_status(error=str(exc))
+                self.next_queue_drain_at = time.time() + QUEUE_DRAIN_INTERVAL_SECONDS
+                ran_work = True
+
+            if not ran_work:
+                next_run_at = min(
+                    value for value in [self.next_fetch_at, self.next_queue_drain_at] if value
+                )
+                self.stop_event.wait(max(0.5, min(5.0, next_run_at - time.time())))
 
 
 def start_mail_poll_worker() -> dict[str, Any]:
@@ -2237,12 +2281,16 @@ def processing_page() -> str:
           const lastAttempt = settings.last_worker_attempt_at ? ` Last attempt: ${{settings.last_worker_attempt_at}}.` : '';
           const cursor = settings.last_successful_fetch_at ? ` Cursor: ${{settings.last_successful_fetch_at}}.` : '';
           const threshold = settings.fetch_not_before_at ? ` Earliest fetch: ${{settings.fetch_not_before_at}}.` : '';
+          const queueDrain = settings.last_queue_drain_at
+            ? ` Queue drain: ${{settings.last_queue_drain_completed_jobs || 0}} jobs at ${{settings.last_queue_drain_at}}.`
+            : '';
+          const queueDrainError = settings.last_queue_drain_error ? ` Queue drain error: ${{settings.last_queue_drain_error}}.` : '';
           if (!settings.enabled && !settings.worker_alive) {{
             status.textContent = `Mail fetcher is stopped. Interval is saved at ${{interval}} minute${{interval === 1 ? '' : 's'}}.${{threshold}} Click Start fetcher to begin polling.`;
             return;
           }}
           if (workerStatus === 'success') {{
-            status.textContent = `Mail fetcher is healthy and runs every ${{interval}} minute${{interval === 1 ? '' : 's'}}. Last run ingested ${{settings.last_worker_ingested || 0}} messages and completed ${{settings.last_worker_completed_jobs || 0}} jobs.${{lastAttempt}}${{cursor}}${{threshold}}`;
+            status.textContent = `Mail fetcher is healthy and runs every ${{interval}} minute${{interval === 1 ? '' : 's'}}. Last fetch ingested ${{settings.last_worker_ingested || 0}} messages.${{lastAttempt}}${{cursor}}${{threshold}}${{queueDrain}}${{queueDrainError}}`;
             return;
           }}
           if (workerStatus === 'waiting_for_mail' || workerStatus === 'waiting_for_outlook') {{

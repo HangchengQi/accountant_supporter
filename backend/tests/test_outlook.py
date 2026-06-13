@@ -1,10 +1,12 @@
 import unittest
 from datetime import UTC, datetime
-from unittest.mock import patch
+import time
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 from app.main import (
     mail_fetch_since_from_cursor,
+    MailPollWorker,
     mail_poll_settings,
     run_mail_poll_worker_once,
     save_mail_poll_settings,
@@ -165,6 +167,7 @@ class OutlookConfigTest(unittest.TestCase):
     def test_save_mail_poll_settings_controls_auto_fetch_interval(self) -> None:
         original = storage.get_connector_settings("mail_poll")
         try:
+            storage.delete_connector_settings("mail_poll")
             status = save_mail_poll_settings({"interval_minutes": "15"})
 
             self.assertEqual(status["interval_minutes"], 15)
@@ -241,6 +244,31 @@ class OutlookConfigTest(unittest.TestCase):
                 self.assertIn("Connect the gmail mail account", settings["last_worker_error"])
         finally:
             stop_mail_poll_worker()
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
+
+    def test_mail_poll_worker_drains_queue_between_fetches(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            save_mail_poll_settings({"interval_minutes": "5", "mail_provider": "outlook"})
+            stop_event = Mock()
+            stop_event.is_set.side_effect = [False, False, True]
+            worker = MailPollWorker(stop_event)
+            worker.next_fetch_at = time.time() + 300
+            worker.next_queue_drain_at = 0
+
+            with (
+                patch("app.main.mail_poll_settings", return_value={"interval_minutes": 5}),
+                patch("app.main.run_mail_poll_worker_once") as fetch,
+                patch("app.main.run_queue_drain_once", return_value={"completed": 2}) as drain,
+            ):
+                worker.run()
+
+            fetch.assert_not_called()
+            drain.assert_called_once()
+        finally:
             if original is not None:
                 storage.save_connector_settings("mail_poll", original)
             else:
