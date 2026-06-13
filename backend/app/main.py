@@ -534,6 +534,7 @@ def mail_poll_settings() -> dict[str, Any]:
         "health_status": health_status,
         "mail_provider": provider,
         "mail_configured": is_mail_provider_configured(provider),
+        "mail_connected": is_mail_provider_connected(provider),
         "fetch_not_before_at": fetch_not_before_at,
         "last_successful_fetch_at": settings.get(f"{provider}_last_successful_fetch_at") or settings.get("last_successful_fetch_at"),
         "last_worker_attempt_at": settings.get("last_worker_attempt_at"),
@@ -1223,6 +1224,12 @@ def start_mail_poll_worker() -> dict[str, Any]:
         settings["last_worker_error"] = f"Configure the {active_mail_provider()} mail connection before starting."
         storage.save_connector_settings("mail_poll", settings)
         raise ValueError(f"Configure the {active_mail_provider()} mail connection before starting the mail fetcher")
+    if not is_mail_provider_connected():
+        settings["worker_enabled"] = False
+        settings["last_worker_status"] = "waiting_for_mail"
+        settings["last_worker_error"] = f"Connect the {active_mail_provider()} mail account before starting."
+        storage.save_connector_settings("mail_poll", settings)
+        raise ValueError(f"Connect the {active_mail_provider()} mail account before starting the mail fetcher")
     settings["worker_enabled"] = True
     settings["last_worker_status"] = "starting"
     settings["last_worker_error"] = ""
@@ -2011,11 +2018,11 @@ def processing_page() -> str:
               </div>
               <div class="pill-stack">
                 <span class="pill" id="mail-poll-health">Fetcher checking</span>
-                <span class="pill" id="outlook-pill">Mail checking</span>
+                <span class="pill" id="mail-connection-pill">Mail checking</span>
               </div>
             </div>
             <div class="toolbar">
-              <button class="secondary" type="button" id="outlook-fetch">Fetch inbox into queue</button>
+              <button class="secondary" type="button" id="mail-fetch">Fetch inbox into queue</button>
               <button class="secondary" type="button" id="queue-run">Run queue</button>
             </div>
             <div class="poll-settings">
@@ -2034,10 +2041,10 @@ def processing_page() -> str:
               <button class="secondary" type="button" id="mail-poll-stop">Stop fetcher</button>
               <button class="secondary" type="button" id="mail-poll-restart">Restart fetcher</button>
             </div>
-            <div class="status" id="outlook-status">Checking status...</div>
+            <div class="status" id="mail-connection-status">Checking mail status...</div>
             <div class="status" id="mail-poll-status">Auto-fetch settings are loading.</div>
             <div class="notice" id="queue-status">Queue status will appear here.</div>
-            <div id="outlook-messages"></div>
+            <div id="mail-messages"></div>
           </div>
         </section>
         <section class="records">
@@ -2082,9 +2089,9 @@ def processing_page() -> str:
         </section>
       </main>
       <script>
-        let outlookMessages = [];
-        let outlookConnected = false;
-        let outlookConfigured = false;
+        let mailMessages = [];
+        let mailConnected = false;
+        let mailConfigured = false;
         let mailProvider = 'outlook';
         const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
           '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
@@ -2108,16 +2115,24 @@ def processing_page() -> str:
           return Number.isNaN(date.getTime()) ? '' : date.toISOString();
         }};
 
-        async function outlookStatus() {{
-          const response = await fetch('/api/outlook/status');
+        async function mailConnectionStatus() {{
+          const providerPath = mailProvider === 'gmail' ? 'gmail' : 'outlook';
+          const providerLabel = mailProvider === 'gmail' ? 'Gmail' : 'Outlook';
+          const response = await fetch(`/api/${{providerPath}}/status`);
           const status = await response.json();
-          const target = document.getElementById('outlook-status');
-          const pill = document.getElementById('outlook-pill');
-          outlookConnected = Boolean(status.connected);
-          outlookConfigured = Boolean(status.configured);
-          pill.textContent = status.connected ? 'Connected' : 'Not connected';
+          const target = document.getElementById('mail-connection-status');
+          const pill = document.getElementById('mail-connection-pill');
+          mailConnected = Boolean(status.connected);
+          mailConfigured = Boolean(status.configured);
+          pill.textContent = status.connected ? `${{providerLabel}} connected` : `${{providerLabel}} not connected`;
           pill.className = status.connected ? 'pill ok' : 'pill';
-          target.textContent = status.connected ? 'Outlook is connected' : 'Connect Outlook on the Connections page first';
+          if (!status.configured) {{
+            target.textContent = `${{providerLabel}} is not configured. Configure it on the Connections page first.`;
+            return status;
+          }}
+          target.textContent = status.connected
+            ? `${{providerLabel}} is connected and selected for mail fetch.`
+            : `Connect ${{providerLabel}} on the Connections page first.`;
           return status;
         }}
 
@@ -2126,12 +2141,12 @@ def processing_page() -> str:
           const response = await fetch(`/api/${{providerPath}}/messages?top=100`);
           const result = await response.json();
           if (!response.ok) {{
-            document.getElementById('outlook-messages').textContent = result.error || 'Unable to fetch messages';
+            document.getElementById('mail-messages').textContent = result.error || 'Unable to fetch messages';
             throw new Error(result.error || 'Unable to fetch messages');
           }}
-          outlookMessages = result.messages || [];
+          mailMessages = result.messages || [];
           await refreshQueueStatus();
-          document.getElementById('outlook-messages').innerHTML = outlookMessages.map((message, index) => `
+          document.getElementById('mail-messages').innerHTML = mailMessages.map((message, index) => `
             <article>
               <strong>${{escapeHtml(message.subject)}}</strong>
               <div class="meta">${{escapeHtml(message.sender)}} | ${{escapeHtml(message.received_at || '')}}</div>
@@ -2161,7 +2176,7 @@ def processing_page() -> str:
           return result;
         }}
 
-        document.getElementById('outlook-fetch').addEventListener('click', async () => {{
+        document.getElementById('mail-fetch').addEventListener('click', async () => {{
           try {{
             await fetchInboxIntoQueue();
           }} catch (error) {{
@@ -2183,6 +2198,7 @@ def processing_page() -> str:
           mailProvider = settings.mail_provider || 'outlook';
           document.getElementById('mail-poll-interval').value = settings.interval_minutes || 0;
           document.getElementById('mail-fetch-not-before').value = toDateTimeLocal(settings.fetch_not_before_at);
+          await mailConnectionStatus();
           renderMailPollStatus(settings);
         }}
 
@@ -2190,7 +2206,8 @@ def processing_page() -> str:
           const status = document.getElementById('mail-poll-status');
           const health = document.getElementById('mail-poll-health');
           const interval = Number(settings.interval_minutes || 0);
-          const mailConfigured = Boolean(settings.mail_configured || outlookConfigured);
+          const selectedMailConfigured = Boolean(settings.mail_configured || mailConfigured);
+          const selectedMailConnected = Boolean(settings.mail_connected || mailConnected);
           const workerStatus = settings.last_worker_status || 'stopped';
           const healthStatus = settings.health_status || 'stopped';
           const healthLabels = {{
@@ -2202,15 +2219,19 @@ def processing_page() -> str:
           }};
           health.textContent = healthLabels[healthStatus] || 'Fetcher checking';
           health.className = healthStatus === 'healthy' ? 'pill ok' : (healthStatus === 'unhealthy' ? 'pill danger' : 'pill');
-          document.getElementById('mail-poll-start').disabled = interval <= 0 || settings.enabled || !mailConfigured;
+          document.getElementById('mail-poll-start').disabled = interval <= 0 || settings.enabled || !selectedMailConnected;
           document.getElementById('mail-poll-stop').disabled = !settings.enabled && !settings.worker_alive;
           document.getElementById('mail-poll-restart').disabled = interval <= 0 || (!settings.enabled && !settings.worker_alive);
           if (!interval) {{
             status.textContent = 'Mail fetcher is disabled. Set the interval above 0, save it, then click Start fetcher.';
             return;
           }}
-          if (!mailConfigured) {{
+          if (!selectedMailConfigured) {{
             status.textContent = `Mail fetcher is stopped because ${{mailProvider === 'gmail' ? 'Gmail' : 'Outlook'}} mail connection is not configured. Configure Mail Authentication first.`;
+            return;
+          }}
+          if (!selectedMailConnected) {{
+            status.textContent = `Mail fetcher is stopped because ${{mailProvider === 'gmail' ? 'Gmail' : 'Outlook'}} is not connected. Connect it on the Connections page first.`;
             return;
           }}
           const lastAttempt = settings.last_worker_attempt_at ? ` Last attempt: ${{settings.last_worker_attempt_at}}.` : '';
@@ -2369,7 +2390,7 @@ def processing_page() -> str:
             `Jobs: pending ${{counts.pending || 0}}, running ${{counts.running || 0}}, completed ${{counts.completed || 0}}, failed ${{counts.failed || 0}}.`;
         }}
 
-        outlookStatus().then(refreshMailPollSettings);
+        refreshMailPollSettings();
         setInterval(refreshMailPollSettings, 30000);
         refreshQueueStatus();
         applyHistoryFilters();

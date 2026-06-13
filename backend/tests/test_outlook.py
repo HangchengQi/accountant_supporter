@@ -184,7 +184,10 @@ class OutlookConfigTest(unittest.TestCase):
         original = storage.get_connector_settings("mail_poll")
         try:
             save_mail_poll_settings({"interval_minutes": "5", "mail_provider": "outlook"})
-            with patch("app.main.is_outlook_configured", return_value=True):
+            with (
+                patch("app.main.is_outlook_configured", return_value=True),
+                patch("app.main.is_mail_provider_connected", return_value=True),
+            ):
                 started = start_mail_poll_worker()
 
             self.assertTrue(started["enabled"])
@@ -213,6 +216,29 @@ class OutlookConfigTest(unittest.TestCase):
             self.assertFalse(settings["enabled"])
             self.assertFalse(settings["worker_alive"])
             self.assertEqual(settings["health_status"], "stopped")
+        finally:
+            stop_mail_poll_worker()
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
+
+    def test_mail_poll_worker_start_requires_selected_provider_connection(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            save_mail_poll_settings({"interval_minutes": "5", "mail_provider": "gmail"})
+            with (
+                patch("app.main.is_mail_provider_configured", return_value=True),
+                patch("app.main.is_mail_provider_connected", return_value=False),
+            ):
+                with self.assertRaises(ValueError):
+                    start_mail_poll_worker()
+
+                settings = mail_poll_settings()
+                self.assertFalse(settings["enabled"])
+                self.assertEqual(settings["last_worker_status"], "stopped")
+                self.assertFalse(settings["mail_connected"])
+                self.assertIn("Connect the gmail mail account", settings["last_worker_error"])
         finally:
             stop_mail_poll_worker()
             if original is not None:
