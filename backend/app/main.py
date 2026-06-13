@@ -39,6 +39,7 @@ ZOHO_BOOKS_API_ROOT = "https://www.zohoapis.com/books/v3"
 MAIL_FETCH_CURSOR_OVERLAP_MINUTES = 10
 MAIL_POLL_BATCH_SIZE = 100
 MAIL_POLL_QUEUE_BATCH_SIZE = 10
+MAIL_FETCH_NOT_BEFORE_KEY = "fetch_not_before_at"
 
 
 def get_database_path() -> str:
@@ -491,9 +492,17 @@ def is_mail_provider_configured(provider: str | None = None) -> bool:
     return is_outlook_configured()
 
 
+def is_mail_provider_connected(provider: str | None = None) -> bool:
+    provider = provider or active_mail_provider()
+    return storage.get_oauth_token(provider) is not None
+
+
 def mail_poll_settings() -> dict[str, Any]:
     settings = storage.get_connector_settings("mail_poll") or {}
     provider = active_mail_provider()
+    fetch_not_before_at = settings.get(f"{provider}_{MAIL_FETCH_NOT_BEFORE_KEY}") or settings.get(MAIL_FETCH_NOT_BEFORE_KEY)
+    if not fetch_not_before_at and is_mail_provider_connected(provider):
+        fetch_not_before_at = ensure_mail_fetch_not_before(provider)
     interval = settings.get("interval_minutes", 0)
     try:
         interval = float(interval)
@@ -525,6 +534,7 @@ def mail_poll_settings() -> dict[str, Any]:
         "health_status": health_status,
         "mail_provider": provider,
         "mail_configured": is_mail_provider_configured(provider),
+        "fetch_not_before_at": fetch_not_before_at,
         "last_successful_fetch_at": settings.get(f"{provider}_last_successful_fetch_at") or settings.get("last_successful_fetch_at"),
         "last_worker_attempt_at": settings.get("last_worker_attempt_at"),
         "last_worker_status": worker_status,
@@ -542,6 +552,10 @@ def save_mail_poll_settings(data: dict[str, Any]) -> dict[str, Any]:
     settings["interval_minutes"] = interval
     provider = str(data.get("mail_provider", settings.get("mail_provider", "outlook"))).strip().lower()
     settings["mail_provider"] = provider if provider in {"outlook", "gmail"} else "outlook"
+    if "fetch_not_before_at" in data:
+        settings[f"{settings['mail_provider']}_{MAIL_FETCH_NOT_BEFORE_KEY}"] = normalize_mail_fetch_not_before(
+            data.get("fetch_not_before_at")
+        )
     if interval <= 0:
         settings["worker_enabled"] = False
         settings["last_worker_status"] = "disabled"
@@ -557,6 +571,42 @@ def update_mail_fetch_cursor(fetched_at: datetime | None = None, provider: str |
     settings[f"{provider}_last_successful_fetch_at"] = fetched_at.isoformat()
     storage.save_connector_settings("mail_poll", settings)
     return mail_poll_settings()
+
+
+def ensure_mail_fetch_not_before(provider: str | None = None, fallback: datetime | None = None) -> str:
+    settings = storage.get_connector_settings("mail_poll") or {}
+    provider = provider or active_mail_provider()
+    key = f"{provider}_{MAIL_FETCH_NOT_BEFORE_KEY}"
+    existing = settings.get(key) or settings.get(MAIL_FETCH_NOT_BEFORE_KEY)
+    if existing:
+        return normalize_mail_fetch_not_before(existing)
+    value = (fallback or datetime.now(UTC)).astimezone(UTC).isoformat(timespec="seconds")
+    settings[key] = value
+    storage.save_connector_settings("mail_poll", settings)
+    return value
+
+
+def normalize_mail_fetch_not_before(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now(UTC).isoformat(timespec="seconds")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("fetch_not_before_at must be a valid date/time") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat(timespec="seconds")
+
+
+def _mail_fetch_floor_dt(provider: str) -> datetime:
+    floor = ensure_mail_fetch_not_before(provider)
+    parsed = datetime.fromisoformat(floor.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def update_mail_poll_worker_status(
@@ -580,16 +630,18 @@ def update_mail_poll_worker_status(
 def mail_fetch_since_from_cursor(provider: str | None = None) -> str | None:
     settings = storage.get_connector_settings("mail_poll") or {}
     provider = provider or active_mail_provider()
+    floor_dt = _mail_fetch_floor_dt(provider)
     cursor = settings.get(f"{provider}_last_successful_fetch_at") or settings.get("last_successful_fetch_at")
-    if not cursor:
-        return None
-    try:
-        cursor_dt = datetime.fromisoformat(str(cursor).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if cursor_dt.tzinfo is None:
-        cursor_dt = cursor_dt.replace(tzinfo=UTC)
-    since = cursor_dt.astimezone(UTC) - timedelta(minutes=MAIL_FETCH_CURSOR_OVERLAP_MINUTES)
+    if cursor:
+        try:
+            cursor_dt = datetime.fromisoformat(str(cursor).replace("Z", "+00:00"))
+        except ValueError:
+            cursor_dt = floor_dt
+        if cursor_dt.tzinfo is None:
+            cursor_dt = cursor_dt.replace(tzinfo=UTC)
+        since = max(cursor_dt.astimezone(UTC) - timedelta(minutes=MAIL_FETCH_CURSOR_OVERLAP_MINUTES), floor_dt)
+    else:
+        since = floor_dt
     return since.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
@@ -887,6 +939,7 @@ def complete_outlook_redirect_auth(query: str) -> str:
 
     token = get_outlook_client().exchange_authorization_code(code)
     storage.save_oauth_token("outlook", token)
+    ensure_mail_fetch_not_before("outlook")
     pending_outlook_state = None
     return auth_result_page(
         "Mail connected",
@@ -914,6 +967,7 @@ def complete_gmail_redirect_auth(query: str) -> str:
         return auth_result_page("Gmail connection failed", "Invalid authorization state.", False)
     token = get_gmail_client().exchange_authorization_code(code)
     storage.save_oauth_token("gmail", token)
+    ensure_mail_fetch_not_before("gmail")
     pending_gmail_state = None
     return auth_result_page(
         "Gmail connected",
@@ -966,6 +1020,7 @@ def poll_outlook_auth() -> dict[str, Any]:
     result = outlook_client.poll_device_code(pending_outlook_auth)
     if result.get("status") == "connected":
         storage.save_oauth_token("outlook", result["token"])
+        ensure_mail_fetch_not_before("outlook")
         pending_outlook_auth = None
     return {key: value for key, value in result.items() if key != "token"}
 
@@ -1968,6 +2023,10 @@ def processing_page() -> str:
                 <label for="mail-poll-interval">Auto-fetch interval (minutes)</label>
                 <input id="mail-poll-interval" type="number" min="0" max="1440" step="0.25" placeholder="0 disables auto-fetch" />
               </div>
+              <div class="filter-field">
+                <label for="mail-fetch-not-before">Fetch messages received after</label>
+                <input id="mail-fetch-not-before" type="datetime-local" />
+              </div>
               <button class="secondary" type="button" id="mail-poll-save">Save auto-fetch</button>
             </div>
             <div class="toolbar">
@@ -2030,6 +2089,24 @@ def processing_page() -> str:
         const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({{
           '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
         }}[char]));
+        const toDateTimeLocal = (value) => {{
+          if (!value) {{
+            return '';
+          }}
+          const date = new Date(value);
+          if (Number.isNaN(date.getTime())) {{
+            return '';
+          }}
+          const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+          return local.toISOString().slice(0, 16);
+        }};
+        const fromDateTimeLocal = (value) => {{
+          if (!value) {{
+            return '';
+          }}
+          const date = new Date(value);
+          return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+        }};
 
         async function outlookStatus() {{
           const response = await fetch('/api/outlook/status');
@@ -2105,6 +2182,7 @@ def processing_page() -> str:
           const settings = await response.json();
           mailProvider = settings.mail_provider || 'outlook';
           document.getElementById('mail-poll-interval').value = settings.interval_minutes || 0;
+          document.getElementById('mail-fetch-not-before').value = toDateTimeLocal(settings.fetch_not_before_at);
           renderMailPollStatus(settings);
         }}
 
@@ -2137,12 +2215,13 @@ def processing_page() -> str:
           }}
           const lastAttempt = settings.last_worker_attempt_at ? ` Last attempt: ${{settings.last_worker_attempt_at}}.` : '';
           const cursor = settings.last_successful_fetch_at ? ` Cursor: ${{settings.last_successful_fetch_at}}.` : '';
+          const threshold = settings.fetch_not_before_at ? ` Earliest fetch: ${{settings.fetch_not_before_at}}.` : '';
           if (!settings.enabled && !settings.worker_alive) {{
-            status.textContent = `Mail fetcher is stopped. Interval is saved at ${{interval}} minute${{interval === 1 ? '' : 's'}}. Click Start fetcher to begin polling.`;
+            status.textContent = `Mail fetcher is stopped. Interval is saved at ${{interval}} minute${{interval === 1 ? '' : 's'}}.${{threshold}} Click Start fetcher to begin polling.`;
             return;
           }}
           if (workerStatus === 'success') {{
-            status.textContent = `Mail fetcher is healthy and runs every ${{interval}} minute${{interval === 1 ? '' : 's'}}. Last run ingested ${{settings.last_worker_ingested || 0}} messages and completed ${{settings.last_worker_completed_jobs || 0}} jobs.${{lastAttempt}}${{cursor}}`;
+            status.textContent = `Mail fetcher is healthy and runs every ${{interval}} minute${{interval === 1 ? '' : 's'}}. Last run ingested ${{settings.last_worker_ingested || 0}} messages and completed ${{settings.last_worker_completed_jobs || 0}} jobs.${{lastAttempt}}${{cursor}}${{threshold}}`;
             return;
           }}
           if (workerStatus === 'waiting_for_mail' || workerStatus === 'waiting_for_outlook') {{
@@ -2162,10 +2241,11 @@ def processing_page() -> str:
 
         document.getElementById('mail-poll-save').addEventListener('click', async () => {{
           const interval = document.getElementById('mail-poll-interval').value;
+          const fetchNotBefore = fromDateTimeLocal(document.getElementById('mail-fetch-not-before').value);
           const response = await fetch('/api/mail-poll/settings', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ interval_minutes: interval }})
+            body: JSON.stringify({{ interval_minutes: interval, fetch_not_before_at: fetchNotBefore }})
           }});
           const result = await response.json();
           if (!response.ok) {{
@@ -2826,7 +2906,7 @@ def base_css() -> str:
       .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
       .poll-settings {
         display: grid;
-        grid-template-columns: minmax(190px, 260px) auto;
+        grid-template-columns: minmax(170px, 230px) minmax(220px, 320px) auto;
         gap: 10px;
         align-items: end;
         margin: 10px 0;

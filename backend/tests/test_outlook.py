@@ -223,12 +223,56 @@ class OutlookConfigTest(unittest.TestCase):
     def test_mail_fetch_cursor_uses_overlap_window(self) -> None:
         original = storage.get_connector_settings("mail_poll")
         try:
-            save_mail_poll_settings({"interval_minutes": "5", "mail_provider": "outlook"})
+            save_mail_poll_settings(
+                {
+                    "interval_minutes": "5",
+                    "mail_provider": "outlook",
+                    "fetch_not_before_at": "2026-06-01T00:00",
+                }
+            )
             status = update_mail_fetch_cursor(datetime(2026, 6, 9, 12, 0, tzinfo=UTC))
 
             self.assertEqual(status["last_successful_fetch_at"], "2026-06-09T12:00:00+00:00")
             self.assertEqual(mail_fetch_since_from_cursor(), "2026-06-09T11:50:00Z")
             self.assertEqual(mail_poll_settings()["interval_minutes"], 5)
+        finally:
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
+
+    def test_mail_fetch_threshold_protects_first_fetch(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            save_mail_poll_settings(
+                {
+                    "interval_minutes": "5",
+                    "mail_provider": "outlook",
+                    "fetch_not_before_at": "2026-06-09T09:15",
+                }
+            )
+
+            self.assertEqual(mail_fetch_since_from_cursor("outlook"), "2026-06-09T09:15:00Z")
+            self.assertEqual(mail_poll_settings()["fetch_not_before_at"], "2026-06-09T09:15:00+00:00")
+        finally:
+            if original is not None:
+                storage.save_connector_settings("mail_poll", original)
+            else:
+                storage.delete_connector_settings("mail_poll")
+
+    def test_mail_fetch_threshold_caps_cursor_overlap(self) -> None:
+        original = storage.get_connector_settings("mail_poll")
+        try:
+            save_mail_poll_settings(
+                {
+                    "interval_minutes": "5",
+                    "mail_provider": "outlook",
+                    "fetch_not_before_at": "2026-06-09T11:55:00Z",
+                }
+            )
+            update_mail_fetch_cursor(datetime(2026, 6, 9, 12, 0, tzinfo=UTC), "outlook")
+
+            self.assertEqual(mail_fetch_since_from_cursor("outlook"), "2026-06-09T11:55:00Z")
         finally:
             if original is not None:
                 storage.save_connector_settings("mail_poll", original)
