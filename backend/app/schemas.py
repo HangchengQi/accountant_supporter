@@ -76,6 +76,25 @@ class Job:
 
 
 @dataclass(frozen=True)
+class FraudReview:
+    id: int
+    mail_message_id: int
+    status: str
+    risk_level: str
+    risk_score: float
+    reasons: list[str]
+    created_at: datetime
+    updated_at: datetime
+    reviewed_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["created_at"] = self.created_at.isoformat()
+        result["updated_at"] = self.updated_at.isoformat()
+        return result
+
+
+@dataclass(frozen=True)
 class ExtractedFields:
     category: str
     confidence: float

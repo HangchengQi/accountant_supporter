@@ -34,6 +34,18 @@ class ClassificationResult:
         return self.category in {"invoice", "receipt", "statement"}
 
 
+@dataclass(frozen=True)
+class FraudCheckResult:
+    risk_level: str
+    risk_score: float
+    reasons: list[str]
+    mode: str = "rules"
+
+    @property
+    def is_high_risk(self) -> bool:
+        return self.risk_level == "high" or self.risk_score >= 0.75
+
+
 class AIProcessor:
     def process(self, email: EmailSampleIn, workflow: Workflow) -> AIResult:
         raise NotImplementedError
@@ -300,6 +312,98 @@ class OpenAIClassifier:
         }
 
 
+class OpenAIFraudVerifier:
+    def __init__(self, config: OpenAIConfig | None = None) -> None:
+        self.config = config or OpenAIConfig.from_env()
+
+    def verify(self, email: EmailSampleIn, fraud_examples: list[dict[str, Any]] | None = None) -> FraudCheckResult:
+        if not self.config.is_configured:
+            raise ValueError("OPENAI_API_KEY is required")
+        examples = fraud_examples or []
+        example_text = json.dumps(examples[-10:], ensure_ascii=False)
+        payload = {
+            "model": self.config.model,
+            "instructions": (
+                "You are a fraud risk reviewer for invoice and bill emails before bookkeeping processing. "
+                "Assess whether the bill may be fraudulent, spoofed, payment-redirection fraud, or otherwise unsafe. "
+                "Use confirmed local fraud samples as strong guidance, but do not mark high risk solely because an email is new. "
+                "Return low, medium, or high risk. Use high only when manual isolation is justified before any invoice processing."
+            ),
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Confirmed local fraud samples JSON:\n{example_text}\n\n"
+                        f"Subject/Header: {email.subject}\n"
+                        f"Sender: {email.sender}\n\n"
+                        f"Email content:\n{email.body}"
+                    ),
+                }
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "invoice_fraud_check",
+                    "strict": True,
+                    "schema": self._schema(),
+                }
+            },
+        }
+        response = self._post_response(payload)
+        result = self._extract_json(response)
+        reasons = [str(reason) for reason in result["reasons"]][:5]
+        return FraudCheckResult(
+            risk_level=str(result["risk_level"]),
+            risk_score=float(result["risk_score"]),
+            reasons=reasons,
+            mode=f"openai:{self.config.model}",
+        )
+
+    def _post_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=45) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8")
+            raise ValueError(f"OpenAI fraud verification failed: {body or exc}") from exc
+
+    def _extract_json(self, response: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(response.get("output_text"), str):
+            return json.loads(response["output_text"])
+        for item in response.get("output", []):
+            for content in item.get("content", []):
+                text = content.get("text")
+                if text:
+                    return json.loads(text)
+        raise ValueError("OpenAI fraud verification response did not include JSON text")
+
+    def _schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["risk_level", "risk_score", "reasons"],
+            "properties": {
+                "risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
+                "risk_score": {"type": "number", "minimum": 0, "maximum": 1},
+                "reasons": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 5,
+                },
+            },
+        }
+
+
 def create_ai_processor(settings: dict[str, Any] | None = None) -> AIProcessor:
     provider = _provider(settings)
     if provider in {"openai", "chatgpt"}:
@@ -326,6 +430,7 @@ def ai_status(settings: dict[str, Any] | None = None) -> dict[str, Any]:
         "model": config.model if config.is_configured else None,
         "job_models": {
             "classify_email": classification_config.model if classification_config.is_configured else "rules",
+            "verify_fraud": classification_config.model if classification_config.is_configured else "rules",
             "process_email": config.model if config.is_configured else "local",
         },
         "settings": {
@@ -371,6 +476,68 @@ def classify_email_with_rules(email: EmailSampleIn) -> ClassificationResult:
     if any(word in text for word in ["bookkeeping", "accounting", "1099", "w-9", "tax"]):
         return ClassificationResult("bookkeeping_question", 0.62, True)
     return ClassificationResult("irrelevant", 0.72, False)
+
+
+def verify_bill_fraud(
+    email: EmailSampleIn,
+    settings: dict[str, Any] | None = None,
+    fraud_examples: list[dict[str, Any]] | None = None,
+) -> FraudCheckResult:
+    rule_result = verify_bill_fraud_with_rules(email, fraud_examples)
+    if rule_result.is_high_risk or _provider(settings) not in {"openai", "chatgpt"}:
+        return rule_result
+    config = OpenAIConfig.from_settings(
+        settings,
+        model_key="openai_classification_model",
+        env_model_key="OPENAI_CLASSIFICATION_MODEL",
+        default_model=DEFAULT_OPENAI_CLASSIFICATION_MODEL,
+    )
+    if not config.is_configured:
+        return rule_result
+    return OpenAIFraudVerifier(config).verify(email, fraud_examples)
+
+
+def verify_bill_fraud_with_rules(
+    email: EmailSampleIn,
+    fraud_examples: list[dict[str, Any]] | None = None,
+) -> FraudCheckResult:
+    text = f"{email.subject}\n{email.sender}\n{email.body}".lower()
+    reasons: list[str] = []
+    score = 0.08
+    risky_patterns = [
+        ("new bank", "Requests payment to new bank details."),
+        ("wire transfer", "Requests wire transfer payment."),
+        ("ach change", "Mentions ACH or bank account change."),
+        ("updated payment", "Mentions updated payment instructions."),
+        ("gift card", "Mentions gift card payment."),
+        ("crypto", "Mentions cryptocurrency payment."),
+        ("urgent", "Uses urgency language."),
+        ("past due immediately", "Uses immediate past-due pressure."),
+    ]
+    for needle, reason in risky_patterns:
+        if needle in text:
+            score += 0.18
+            reasons.append(reason)
+    if re.search(r"\bpay(?:ment)?\s+(?:today|now|immediately)\b", text):
+        score += 0.14
+        reasons.append("Pushes immediate payment timing.")
+    if "reply-to:" in text and "from:" in text:
+        score += 0.12
+        reasons.append("Contains explicit mail header fields that may indicate forwarding or spoof analysis is needed.")
+    for sample in fraud_examples or []:
+        sample_sender = str(sample.get("sender", "")).lower()
+        sample_subject = str(sample.get("subject", "")).lower()
+        if sample_sender and sample_sender in text:
+            score += 0.25
+            reasons.append("Sender matches a locally confirmed fraud sample.")
+        elif sample_subject and sample_subject[:30] in text:
+            score += 0.18
+            reasons.append("Subject resembles a locally confirmed fraud sample.")
+    if not reasons:
+        return FraudCheckResult("low", 0.12, ["No obvious fraud indicators found by local rules."])
+    score = min(score, 0.98)
+    risk_level = "high" if score >= 0.75 else ("medium" if score >= 0.35 else "low")
+    return FraudCheckResult(risk_level, score, reasons[:5])
 
 
 class LocalHeuristicProcessor(AIProcessor):

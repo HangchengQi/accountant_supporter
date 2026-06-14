@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .schemas import EmailSampleIn, ExtractedFields, Job, MailMessage, ProcessedEmail
+from .schemas import EmailSampleIn, ExtractedFields, FraudReview, Job, MailMessage, ProcessedEmail
 from .workflow import Workflow
 
 
@@ -111,6 +111,22 @@ class SQLiteStorage:
                     event_type TEXT NOT NULL,
                     details_json TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fraud_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mail_message_id INTEGER NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    risk_level TEXT NOT NULL,
+                    risk_score REAL NOT NULL,
+                    reasons_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    FOREIGN KEY(mail_message_id) REFERENCES mail_messages(id)
                 )
                 """
             )
@@ -408,6 +424,96 @@ class SQLiteStorage:
                 (status, category, confidence, now, mail_message_id),
             )
 
+    def save_fraud_review(
+        self,
+        mail_message_id: int,
+        status: str,
+        risk_level: str,
+        risk_score: float,
+        reasons: list[str],
+    ) -> FraudReview:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO fraud_reviews (
+                    mail_message_id, status, risk_level, risk_score,
+                    reasons_json, created_at, updated_at, reviewed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(mail_message_id)
+                DO UPDATE SET status = excluded.status,
+                              risk_level = excluded.risk_level,
+                              risk_score = excluded.risk_score,
+                              reasons_json = excluded.reasons_json,
+                              updated_at = excluded.updated_at,
+                              reviewed_at = NULL
+                """,
+                (
+                    mail_message_id,
+                    status,
+                    risk_level,
+                    risk_score,
+                    json.dumps(reasons),
+                    now,
+                    now,
+                ),
+            )
+        review = self.get_fraud_review_by_mail_message(mail_message_id)
+        if review is None:
+            raise ValueError("fraud review was not saved")
+        return review
+
+    def list_fraud_reviews(self, status: str | None = None, limit: int = 50) -> list[FraudReview]:
+        query = "SELECT * FROM fraud_reviews"
+        params: tuple[Any, ...] = ()
+        if status:
+            query += " WHERE status = ?"
+            params = (status,)
+        query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        params = (*params, limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._row_to_fraud_review(row) for row in rows]
+
+    def get_fraud_review(self, review_id: int) -> FraudReview | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM fraud_reviews
+                WHERE id = ?
+                """,
+                (review_id,),
+            ).fetchone()
+        return self._row_to_fraud_review(row) if row else None
+
+    def get_fraud_review_by_mail_message(self, mail_message_id: int) -> FraudReview | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM fraud_reviews
+                WHERE mail_message_id = ?
+                """,
+                (mail_message_id,),
+            ).fetchone()
+        return self._row_to_fraud_review(row) if row else None
+
+    def update_fraud_review_status(self, review_id: int, status: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE fraud_reviews
+                SET status = ?,
+                    updated_at = ?,
+                    reviewed_at = ?
+                WHERE id = ?
+                """,
+                (status, now, now, review_id),
+            )
+
     def create_job(
         self,
         job_type: str,
@@ -627,4 +733,17 @@ class SQLiteStorage:
             error=row["error"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def _row_to_fraud_review(self, row: sqlite3.Row) -> FraudReview:
+        return FraudReview(
+            id=row["id"],
+            mail_message_id=row["mail_message_id"],
+            status=row["status"],
+            risk_level=row["risk_level"],
+            risk_score=float(row["risk_score"]),
+            reasons=json.loads(row["reasons_json"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            reviewed_at=row["reviewed_at"],
         )

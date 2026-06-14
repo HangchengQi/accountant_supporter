@@ -26,7 +26,7 @@ from .ai import (
 )
 from .billing import BillAttachment, save_billing_artifacts
 from .gmail import GmailClient, GmailConfig
-from .jobs import REVIEW_ACCOUNT, enqueue_mail_message, queue_status, run_queue_once
+from .jobs import PROCESS_EMAIL, REVIEW_ACCOUNT, enqueue_mail_message, queue_status, run_queue_once
 from .outlook import DeviceCodeSession, OutlookConfig, OutlookGraphClient
 from .pdf_context import append_attachment_context, build_attachment_context
 from .schemas import EmailSampleIn, ExtractedFields, MailMessage, ProcessedEmail
@@ -1515,6 +1515,76 @@ def discard_processed_email(processed_email_id: int, reason: str = "") -> dict[s
     return refreshed.to_dict() if refreshed else record.to_dict()
 
 
+def list_pending_fraud_reviews() -> list[dict[str, Any]]:
+    reviews = storage.list_fraud_reviews(status="pending_review")
+    items: list[dict[str, Any]] = []
+    for review in reviews:
+        message = storage.get_mail_message(review.mail_message_id)
+        if message is None:
+            continue
+        items.append({"review": review.to_dict(), "message": message.to_dict()})
+    return items
+
+
+def confirm_fraud_review(review_id: int) -> dict[str, Any]:
+    review = storage.get_fraud_review(review_id)
+    if review is None:
+        raise ValueError("fraud review not found")
+    message = storage.get_mail_message(review.mail_message_id)
+    if message is None:
+        raise ValueError("mail message not found")
+    memory = storage.get_connector_settings("fraud_memory") or {}
+    examples = list(memory.get("confirmed_fraud_examples", []))
+    examples.append(
+        {
+            "sender": message.sender,
+            "subject": message.subject,
+            "body_excerpt": (message.body or message.body_preview)[:1000],
+            "risk_level": review.risk_level,
+            "risk_score": review.risk_score,
+            "reasons": review.reasons,
+            "confirmed_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    storage.save_connector_settings("fraud_memory", {"confirmed_fraud_examples": examples[-50:]})
+    storage.update_fraud_review_status(review.id, "confirmed_fraud")
+    storage.update_mail_classification(
+        mail_message_id=message.id,
+        status="confirmed_fraud",
+        category=message.classification_category,
+        confidence=message.classification_confidence,
+    )
+    updated = storage.get_fraud_review(review.id)
+    return {"review": updated.to_dict() if updated else review.to_dict(), "memory_count": len(examples[-50:])}
+
+
+def clear_fraud_review(review_id: int) -> dict[str, Any]:
+    review = storage.get_fraud_review(review_id)
+    if review is None:
+        raise ValueError("fraud review not found")
+    message = storage.get_mail_message(review.mail_message_id)
+    if message is None:
+        raise ValueError("mail message not found")
+    storage.update_fraud_review_status(review.id, "cleared")
+    storage.update_mail_classification(
+        mail_message_id=message.id,
+        status="relevant",
+        category=message.classification_category,
+        confidence=message.classification_confidence,
+    )
+    job = storage.ensure_pending_job(
+        job_type=PROCESS_EMAIL,
+        mail_message_id=message.id,
+        payload={
+            "classification_category": message.classification_category,
+            "fraud_review_id": review.id,
+            "fraud_review_cleared": True,
+        },
+        priority=40,
+    )
+    return {"review_id": review.id, "job": job.to_dict()}
+
+
 def process_account_review(payload: dict[str, Any]) -> ProcessedEmail:
     processed_id = int(payload["processed_email_id"])
     suggestion = str(payload["suggested_account"]).strip()
@@ -2099,7 +2169,7 @@ def index() -> str:
             pill.className = 'pill ok';
             target.textContent = 'ChatGPT/OpenAI processing is active';
             config.textContent =
-              `Models: classify_email=${status.job_models?.classify_email || 'rules'}, process_email=${status.job_models?.process_email || status.model}. API key is saved locally and hidden.`;
+              `Models: classify_email=${status.job_models?.classify_email || 'rules'}, verify_fraud=${status.job_models?.verify_fraud || 'rules'}, process_email=${status.job_models?.process_email || status.model}. API key is saved locally and hidden.`;
             return;
           }
           pill.textContent = 'Local';
@@ -2270,6 +2340,7 @@ def index() -> str:
 
 def processing_page() -> str:
     records = storage.list_processed_emails()
+    fraud_reviews = list_pending_fraud_reviews()
     pending_records = [
         record
         for record in records
@@ -2277,6 +2348,7 @@ def processing_page() -> str:
         and _is_bill_relevant_category(record.extracted.category)
     ]
     history_records = [record for record in records if record.zoho_status not in {"pending_approval", "upload_failed"}]
+    fraud_items = "\n".join(render_fraud_review(item) for item in fraud_reviews)
     pending_items = "\n".join(render_record(record, section="pending") for record in pending_records)
     history_items = "\n".join(render_record(record, section="history") for record in history_records)
     body = f"""
@@ -2318,6 +2390,16 @@ def processing_page() -> str:
             <div class="notice" id="queue-status">Queue status will appear here.</div>
             <div id="mail-messages"></div>
           </div>
+        </section>
+        <section class="records">
+          <div class="connector-head">
+            <div>
+              <h2>Fraud Review</h2>
+              <p>High-risk bill emails isolated before summary, attachment handling, or Zoho upload.</p>
+            </div>
+            <span class="pill danger">{len(fraud_reviews)} isolated</span>
+          </div>
+          <div class="fraud-reviews" id="fraud-reviews">{fraud_items or "<p>No bills are isolated for fraud review.</p>"}</div>
         </section>
         <section class="records">
           <div class="connector-head">
@@ -2442,7 +2524,7 @@ def processing_page() -> str:
             throw new Error(result.error || 'Unable to run queue');
           }}
           document.getElementById('queue-status').textContent =
-            `Queue run: claimed ${{result.claimed}}, completed ${{result.completed}}, created processing jobs ${{result.created_processing_jobs}}, skipped ${{result.skipped_irrelevant}}.`;
+            `Queue run: claimed ${{result.claimed}}, completed ${{result.completed}}, created processing jobs ${{result.created_processing_jobs}}, isolated fraud reviews ${{result.isolated_fraud || 0}}, skipped ${{result.skipped_irrelevant}}.`;
           if (result.completed > 0) {{
             window.location.reload();
           }}
@@ -2567,7 +2649,7 @@ def processing_page() -> str:
         document.getElementById('mail-poll-stop').addEventListener('click', () => postMailPollAction('stop'));
         document.getElementById('mail-poll-restart').addEventListener('click', () => postMailPollAction('restart'));
 
-        document.querySelector('.records').addEventListener('click', async (event) => {{
+        document.getElementById('pending-records').addEventListener('click', async (event) => {{
           const approveButton = event.target.closest('.approve-record');
           const rejectButton = event.target.closest('.reject-record');
           const discardButton = event.target.closest('.discard-record');
@@ -2617,6 +2699,27 @@ def processing_page() -> str:
           const result = await response.json();
           if (!response.ok) {{
             status.textContent = result.error || 'Unable to re-run classification';
+            return;
+          }}
+          window.location.reload();
+        }});
+
+        document.getElementById('fraud-reviews').addEventListener('click', async (event) => {{
+          const fraudButton = event.target.closest('.confirm-fraud');
+          const clearButton = event.target.closest('.clear-fraud');
+          if (!fraudButton && !clearButton) {{
+            return;
+          }}
+          const reviewId = (fraudButton || clearButton).dataset.reviewId;
+          const status = document.getElementById(`fraud-status-${{reviewId}}`);
+          const action = fraudButton ? 'confirm' : 'clear';
+          status.textContent = fraudButton
+            ? 'Saving fraud sample...'
+            : 'Returning bill to the processing queue...';
+          const response = await fetch(`/api/fraud-reviews/${{reviewId}}/${{action}}`, {{ method: 'POST' }});
+          const result = await response.json();
+          if (!response.ok) {{
+            status.textContent = result.error || 'Unable to update fraud review';
             return;
           }}
           window.location.reload();
@@ -2714,6 +2817,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/processed-emails":
             self._send_json([record.to_dict() for record in list_processed_emails()])
+            return
+        if path == "/api/fraud-reviews":
+            self._send_json(list_pending_fraud_reviews())
             return
         if path == "/api/outlook/status":
             self._send_json(outlook_status())
@@ -2869,6 +2975,20 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
+        if path.startswith("/api/fraud-reviews/") and path.endswith("/confirm"):
+            try:
+                review_id = int(path.split("/")[3])
+                self._send_json(confirm_fraud_review(review_id))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path.startswith("/api/fraud-reviews/") and path.endswith("/clear"):
+            try:
+                review_id = int(path.split("/")[3])
+                self._send_json(clear_fraud_review(review_id))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/jobs/run":
             try:
                 payload = self._read_json()
@@ -3013,6 +3133,36 @@ def render_record(record: ProcessedEmail, section: str = "history") -> str:
           <dt>Account reason</dt><dd>{html.escape(extracted.account_reason or "")}</dd>
         </dl>
         {actions}
+      </article>
+    """
+
+
+def render_fraud_review(item: dict[str, Any]) -> str:
+    review = item["review"]
+    message = item["message"]
+    reasons = review.get("reasons") or []
+    reasons_html = "".join(f"<li>{html.escape(str(reason))}</li>" for reason in reasons)
+    content = str(message.get("body") or message.get("body_preview") or "")
+    return f"""
+      <article class="fraud-card">
+        <div class="record-head">
+          <div>
+            <strong>{html.escape(str(message.get("subject") or "No subject"))}</strong>
+            <div class="meta">Sender: {html.escape(str(message.get("sender") or ""))}</div>
+            <div class="meta">Received: {html.escape(str(message.get("received_at") or ""))}</div>
+          </div>
+          <span class="pill danger">{html.escape(str(review.get("risk_level", "high")).title())} risk {float(review.get("risk_score", 0.0)):.2f}</span>
+        </div>
+        <dl>
+          <dt>Header</dt><dd>{html.escape(str(message.get("subject") or ""))}</dd>
+          <dt>Content</dt><dd>{html.escape(content[:2000])}</dd>
+          <dt>AI fraud reason</dt><dd><ul>{reasons_html}</ul></dd>
+        </dl>
+        <div class="toolbar">
+          <button class="danger confirm-fraud" type="button" data-review-id="{review["id"]}">Verify as fraud</button>
+          <button class="secondary clear-fraud" type="button" data-review-id="{review["id"]}">Not fraud, continue processing</button>
+        </div>
+        <div class="status" id="fraud-status-{review["id"]}"></div>
       </article>
     """
 
@@ -3217,6 +3367,11 @@ def base_css() -> str:
         border: 1px solid #c9d4db;
       }
       button.secondary:hover { background: #e0e9ed; }
+      button.danger {
+        background: #9d2b2b;
+        color: #ffffff;
+      }
+      button.danger:hover { background: #7d2020; }
       button:disabled {
         cursor: not-allowed;
         opacity: 0.55;
@@ -3285,6 +3440,12 @@ def base_css() -> str:
       }
       article { border-top: 1px solid var(--line); padding: 14px 0; }
       article:first-child { border-top: 0; padding-top: 0; }
+      .record-head {
+        display: flex;
+        align-items: start;
+        justify-content: space-between;
+        gap: 12px;
+      }
       .meta { color: var(--muted); font-size: 13px; margin: 4px 0 8px; }
       .badge {
         display: inline-block;
