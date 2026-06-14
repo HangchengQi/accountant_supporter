@@ -55,7 +55,8 @@ def get_workflow_path() -> str:
 
 
 def get_bills_root() -> str:
-    return os.getenv("BILLS_ROOT", "./data/bills")
+    configured_root = invoice_storage_settings().get("invoice_directory", "")
+    return configured_root or os.getenv("BILLS_ROOT", "./data/bills")
 
 
 def get_logs_root() -> str:
@@ -448,6 +449,34 @@ def log_settings() -> dict[str, Any]:
         "last_send_error": settings.get("last_send_error", ""),
         "saved_locally": bool(settings),
     }
+
+
+def invoice_storage_settings() -> dict[str, Any]:
+    settings = storage.get_connector_settings("invoice_storage") or {}
+    default_directory = os.getenv("BILLS_ROOT", "./data/bills")
+    invoice_directory = str(settings.get("invoice_directory") or default_directory).strip()
+    return {
+        "invoice_directory": invoice_directory,
+        "default_directory": default_directory,
+        "saved_locally": bool(settings),
+    }
+
+
+def save_invoice_storage_settings(data: dict[str, Any]) -> dict[str, Any]:
+    invoice_directory = str(data.get("invoice_directory", "")).strip()
+    if not invoice_directory:
+        raise ValueError("invoice_directory is required")
+    root = Path(invoice_directory).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise ValueError("invoice_directory must be a folder")
+    storage.save_connector_settings(
+        "invoice_storage",
+        {
+            "invoice_directory": str(root),
+        },
+    )
+    return invoice_storage_settings()
 
 
 def approval_settings() -> dict[str, Any]:
@@ -1672,6 +1701,22 @@ def index() -> str:
         <section class="connection-card">
           <div class="connector-head">
             <div>
+              <h2>Invoice Storage</h2>
+              <p>Choose the local root folder where invoice attachments are saved.</p>
+            </div>
+            <span class="pill" id="invoice-storage-pill">Checking</span>
+          </div>
+          <label for="invoice-directory">Invoice Directory</label>
+          <input id="invoice-directory" autocomplete="off" placeholder="./data/bills" />
+          <div class="toolbar">
+            <button class="secondary" type="button" id="invoice-storage-save">Save invoice directory</button>
+          </div>
+          <div class="status" id="invoice-storage-status">Invoice storage settings are loading.</div>
+        </section>
+
+        <section class="connection-card">
+          <div class="connector-head">
+            <div>
               <h2>Approval Rules</h2>
               <p>Control when AI-selected Zoho expense accounts can auto-upload.</p>
             </div>
@@ -1696,7 +1741,7 @@ def index() -> str:
         };
 
         async function refreshConnectionStatus() {
-          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshApprovalSettings()]);
+          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshInvoiceStorageSettings(), refreshApprovalSettings()]);
         }
 
         async function refreshOutlookStatus() {
@@ -2105,6 +2150,35 @@ def index() -> str:
             return;
           }
           await refreshLogSettings();
+        });
+
+        async function refreshInvoiceStorageSettings() {
+          const response = await fetch('/api/invoice-storage/settings');
+          const settings = await response.json();
+          const pill = document.getElementById('invoice-storage-pill');
+          const status = document.getElementById('invoice-storage-status');
+          document.getElementById('invoice-directory').value =
+            settings.invoice_directory || settings.default_directory || './data/bills';
+          pill.textContent = settings.saved_locally ? 'Configured' : 'Default';
+          pill.className = settings.saved_locally ? 'pill ok' : 'pill';
+          status.textContent =
+            `Invoices will be saved under ${settings.invoice_directory || settings.default_directory || './data/bills'} in BillingYYYY-MM-DD folders.`;
+        }
+
+        document.getElementById('invoice-storage-save').addEventListener('click', async () => {
+          const response = await fetch('/api/invoice-storage/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              invoice_directory: document.getElementById('invoice-directory').value
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            document.getElementById('invoice-storage-status').textContent = result.error || 'Unable to save invoice directory';
+            return;
+          }
+          await refreshInvoiceStorageSettings();
         });
 
         async function refreshApprovalSettings() {
@@ -2606,6 +2680,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/log/settings":
             self._send_json(log_settings())
             return
+        if path == "/api/invoice-storage/settings":
+            self._send_json(invoice_storage_settings())
+            return
         if path == "/api/approval/settings":
             self._send_json(approval_settings())
             return
@@ -2664,6 +2741,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/log/settings":
             try:
                 self._send_json(save_log_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/invoice-storage/settings":
+            try:
+                self._send_json(save_invoice_storage_settings(self._read_json()))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return

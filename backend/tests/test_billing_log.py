@@ -4,7 +4,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from app.main import _handle_billing_artifacts, send_daily_billing_log_if_due, storage
+from app.main import (
+    _handle_billing_artifacts,
+    get_bills_root,
+    save_invoice_storage_settings,
+    send_daily_billing_log_if_due,
+    storage,
+)
 from app.billing import BillAttachment
 from app.schemas import ExtractedFields, MailMessage, ProcessedEmail
 
@@ -52,6 +58,31 @@ def _processed() -> ProcessedEmail:
 
 
 class DailyBillingLogSendTest(unittest.TestCase):
+    def test_invoice_storage_setting_controls_billing_root(self) -> None:
+        original = storage.get_connector_settings("invoice_storage")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "custom-invoices"
+                settings = save_invoice_storage_settings({"invoice_directory": str(root)})
+
+                self.assertEqual(settings["invoice_directory"], str(root))
+                self.assertEqual(get_bills_root(), str(root))
+
+                with patch("app.main.get_logs_root", return_value=str(Path(directory) / "logs")):
+                    artifacts = _handle_billing_artifacts(
+                        _message(),
+                        _processed(),
+                        [BillAttachment(name="invoice.pdf", content=b"pdf")],
+                    )
+
+                self.assertEqual(artifacts.billing_folder.parent, root)
+                self.assertTrue(artifacts.saved_files[0].exists())
+        finally:
+            if original is not None:
+                storage.save_connector_settings("invoice_storage", original)
+            else:
+                storage.delete_connector_settings("invoice_storage")
+
     def test_processing_bill_only_appends_log_without_sending_email(self) -> None:
         original = storage.get_connector_settings("billing_log")
         try:
