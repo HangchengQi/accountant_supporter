@@ -479,6 +479,37 @@ def save_invoice_storage_settings(data: dict[str, Any]) -> dict[str, Any]:
     return invoice_storage_settings()
 
 
+def browse_invoice_storage_directory() -> dict[str, Any]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError("Windows folder picker is not available in this Python environment") from exc
+
+    current = Path(invoice_storage_settings()["invoice_directory"]).expanduser()
+    initial_dir = current if current.exists() else Path.cwd()
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    root.update()
+    try:
+        selected = filedialog.askdirectory(
+            parent=root,
+            initialdir=str(initial_dir),
+            title="Choose invoice save directory",
+            mustexist=True,
+        )
+    finally:
+        root.destroy()
+    if not selected:
+        settings = invoice_storage_settings()
+        settings["selected"] = False
+        return settings
+    settings = save_invoice_storage_settings({"invoice_directory": selected})
+    settings["selected"] = True
+    return settings
+
+
 def approval_settings() -> dict[str, Any]:
     settings = storage.get_connector_settings("approval") or {}
     threshold = settings.get("account_confidence_threshold", 0.85)
@@ -1709,6 +1740,7 @@ def index() -> str:
           <label for="invoice-directory">Invoice Directory</label>
           <input id="invoice-directory" autocomplete="off" placeholder="./data/bills" />
           <div class="toolbar">
+            <button type="button" id="invoice-storage-browse">Browse</button>
             <button class="secondary" type="button" id="invoice-storage-save">Save invoice directory</button>
           </div>
           <div class="status" id="invoice-storage-status">Invoice storage settings are loading.</div>
@@ -2178,6 +2210,24 @@ def index() -> str:
             document.getElementById('invoice-storage-status').textContent = result.error || 'Unable to save invoice directory';
             return;
           }
+          await refreshInvoiceStorageSettings();
+        });
+
+        document.getElementById('invoice-storage-browse').addEventListener('click', async () => {
+          const status = document.getElementById('invoice-storage-status');
+          status.textContent = 'Opening Windows folder picker...';
+          const response = await fetch('/api/invoice-storage/browse', { method: 'POST' });
+          const result = await response.json();
+          if (!response.ok) {
+            status.textContent = result.error || 'Unable to open folder picker';
+            return;
+          }
+          if (!result.selected) {
+            status.textContent = 'Folder selection was canceled.';
+            await refreshInvoiceStorageSettings();
+            return;
+          }
+          document.getElementById('invoice-directory').value = result.invoice_directory || '';
           await refreshInvoiceStorageSettings();
         });
 
@@ -2747,6 +2797,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/invoice-storage/settings":
             try:
                 self._send_json(save_invoice_storage_settings(self._read_json()))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/invoice-storage/browse":
+            try:
+                self._send_json(browse_invoice_storage_directory())
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
