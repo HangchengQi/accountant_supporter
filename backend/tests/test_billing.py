@@ -57,7 +57,7 @@ class BillingArtifactsTest(unittest.TestCase):
             )
 
             saved_file = artifacts.saved_files[0]
-            self.assertEqual(artifacts.billing_folder.name, "Billing2026-06-05")
+            self.assertEqual(artifacts.billing_folder.name, "Billing06-05-2026")
             self.assertEqual(saved_file.name, "Test_Vendor_2026-06-05_INV-100.pdf")
             self.assertEqual(saved_file.read_bytes(), b"pdf bytes")
             log_text = artifacts.daily_log.read_text(encoding="utf-8")

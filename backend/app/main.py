@@ -2194,7 +2194,7 @@ def index() -> str:
           pill.textContent = settings.saved_locally ? 'Configured' : 'Default';
           pill.className = settings.saved_locally ? 'pill ok' : 'pill';
           status.textContent =
-            `Invoices will be saved under ${settings.invoice_directory || settings.default_directory || './data/bills'} in BillingYYYY-MM-DD folders.`;
+            `Invoices will be saved under ${settings.invoice_directory || settings.default_directory || './data/bills'} in BillingMM-DD-YYYY folders.`;
         }
 
         document.getElementById('invoice-storage-save').addEventListener('click', async () => {

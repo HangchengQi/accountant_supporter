@@ -29,7 +29,7 @@ def save_billing_artifacts(
     logs_root: str,
 ) -> BillingArtifacts:
     email_date = _email_date(message.received_at)
-    billing_folder = Path(bills_root) / f"Billing{email_date}"
+    billing_folder = Path(bills_root) / f"Billing{_billing_folder_date(email_date)}"
     billing_folder.mkdir(parents=True, exist_ok=True)
 
     saved_files = [
@@ -105,6 +105,14 @@ def _email_date(received_at: str | None) -> str:
         return datetime.fromisoformat(normalized).date().isoformat()
     except ValueError:
         return datetime.now(UTC).date().isoformat()
+
+
+def _billing_folder_date(email_date: str) -> str:
+    try:
+        parsed = datetime.strptime(email_date, "%Y-%m-%d")
+    except ValueError:
+        return email_date
+    return parsed.strftime("%m-%d-%Y")
 
 
 def _safe_part(value: str) -> str:
