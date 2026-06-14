@@ -1621,6 +1621,7 @@ def page_shell(title: str, body: str, active: str = "") -> str:
       <nav>
         <a class="{_active(active, 'home')}" href="/">Connections</a>
         <a class="{_active(active, 'processing')}" href="/processing">Processing</a>
+        <a class="{_active(active, 'history')}" href="/history">History</a>
       </nav>
     """
     return f"""
@@ -2347,10 +2348,8 @@ def processing_page() -> str:
         if record.zoho_status in {"pending_approval", "upload_failed"}
         and _is_bill_relevant_category(record.extracted.category)
     ]
-    history_records = [record for record in records if record.zoho_status not in {"pending_approval", "upload_failed"}]
     fraud_items = "\n".join(render_fraud_review(item) for item in fraud_reviews)
     pending_items = "\n".join(render_record(record, section="pending") for record in pending_records)
-    history_items = "\n".join(render_record(record, section="history") for record in history_records)
     body = f"""
       <main>
         <section>
@@ -2410,37 +2409,6 @@ def processing_page() -> str:
             <span class="pill">{len(pending_records)} pending</span>
           </div>
           <div id="pending-records">{pending_items or "<p>No invoices are waiting for approval.</p>"}</div>
-          <div class="history-head">
-            <h2>Approval History</h2>
-            <p>Completed approvals, automatic submissions, and reviewed items.</p>
-          </div>
-          <div class="history-filters">
-            <div class="filter-field">
-              <label for="history-status-filter">Status</label>
-              <select id="history-status-filter">
-                <option value="all">All history</option>
-                <option value="manual_review">Review required</option>
-                <option value="automated_submission">Automated submission</option>
-                <option value="manual_submission">Manual submission</option>
-                <option value="failed">Failed submission</option>
-                <option value="not_bill">Not bill-relevant</option>
-                <option value="discarded">Discarded</option>
-              </select>
-            </div>
-            <div class="filter-field">
-              <label for="history-from-filter">From timestamp</label>
-              <input id="history-from-filter" type="datetime-local" />
-            </div>
-            <div class="filter-field">
-              <label for="history-to-filter">To timestamp</label>
-              <input id="history-to-filter" type="datetime-local" />
-            </div>
-          </div>
-          <div class="toolbar">
-            <button class="secondary" type="button" id="history-clear-filters">Clear filters</button>
-          </div>
-          <div class="status" id="history-filter-status"></div>
-          <div id="history-records">{history_items or "<p>No approval history yet.</p>"}</div>
         </section>
       </main>
       <script>
@@ -2725,6 +2693,69 @@ def processing_page() -> str:
           window.location.reload();
         }});
 
+        async function refreshQueueStatus() {{
+          const response = await fetch('/api/jobs/status');
+          const status = await response.json();
+          if (!response.ok) {{
+            return;
+          }}
+          const counts = status.job_counts || {{}};
+          document.getElementById('queue-status').textContent =
+            `Jobs: pending ${{counts.pending || 0}}, running ${{counts.running || 0}}, completed ${{counts.completed || 0}}, failed ${{counts.failed || 0}}.`;
+        }}
+
+        refreshMailPollSettings();
+        setInterval(refreshMailPollSettings, 30000);
+        refreshQueueStatus();
+      </script>
+    """
+    return page_shell("Accountant Supporter Processing", body, active="processing")
+
+
+def history_page() -> str:
+    records = storage.list_processed_emails()
+    history_records = [record for record in records if record.zoho_status not in {"pending_approval", "upload_failed"}]
+    history_items = "\n".join(render_record(record, section="history") for record in history_records)
+    body = f"""
+      <main class="history-main">
+        <section class="records">
+          <div class="connector-head">
+            <div>
+              <h2>Approval History</h2>
+              <p>Completed approvals, automatic submissions, reviewed items, and skipped non-bill messages.</p>
+            </div>
+            <span class="pill">{len(history_records)} records</span>
+          </div>
+          <div class="history-filters">
+            <div class="filter-field">
+              <label for="history-status-filter">Status</label>
+              <select id="history-status-filter">
+                <option value="all">All history</option>
+                <option value="manual_review">Review required</option>
+                <option value="automated_submission">Automated submission</option>
+                <option value="manual_submission">Manual submission</option>
+                <option value="failed">Failed submission</option>
+                <option value="not_bill">Not bill-relevant</option>
+                <option value="discarded">Discarded</option>
+              </select>
+            </div>
+            <div class="filter-field">
+              <label for="history-from-filter">From timestamp</label>
+              <input id="history-from-filter" type="datetime-local" />
+            </div>
+            <div class="filter-field">
+              <label for="history-to-filter">To timestamp</label>
+              <input id="history-to-filter" type="datetime-local" />
+            </div>
+          </div>
+          <div class="toolbar">
+            <button class="secondary" type="button" id="history-clear-filters">Clear filters</button>
+          </div>
+          <div class="status" id="history-filter-status"></div>
+          <div id="history-records">{history_items or "<p>No approval history yet.</p>"}</div>
+        </section>
+      </main>
+      <script>
         function applyHistoryFilters() {{
           const statusFilter = document.getElementById('history-status-filter').value;
           const fromValue = document.getElementById('history-from-filter').value;
@@ -2759,24 +2790,10 @@ def processing_page() -> str:
           applyHistoryFilters();
         }});
 
-        async function refreshQueueStatus() {{
-          const response = await fetch('/api/jobs/status');
-          const status = await response.json();
-          if (!response.ok) {{
-            return;
-          }}
-          const counts = status.job_counts || {{}};
-          document.getElementById('queue-status').textContent =
-            `Jobs: pending ${{counts.pending || 0}}, running ${{counts.running || 0}}, completed ${{counts.completed || 0}}, failed ${{counts.failed || 0}}.`;
-        }}
-
-        refreshMailPollSettings();
-        setInterval(refreshMailPollSettings, 30000);
-        refreshQueueStatus();
         applyHistoryFilters();
       </script>
     """
-    return page_shell("Accountant Supporter Processing", body, active="processing")
+    return page_shell("Accountant Supporter History", body, active="history")
 
 
 class AccountantSupportHandler(BaseHTTPRequestHandler):
@@ -2789,6 +2806,9 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             return
         if path == "/processing":
             self._send_html(processing_page())
+            return
+        if path == "/history":
+            self._send_html(history_page())
             return
         if path == "/auth/outlook/start":
             self._auth_redirect(start_outlook_redirect_auth, "Mail setup needed")
@@ -3288,6 +3308,9 @@ def base_css() -> str:
       .connection-main {
         grid-template-columns: repeat(2, minmax(320px, 1fr));
         align-items: start;
+      }
+      .history-main {
+        grid-template-columns: minmax(420px, 1fr);
       }
       .auth-result {
         display: block;
