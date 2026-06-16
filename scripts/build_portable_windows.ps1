@@ -226,9 +226,58 @@ public static class AccountantSupporterStopper
 }
 '@
 
+function Compile-PortableExe {
+    param(
+        [string]$Source,
+        [string]$OutputAssembly,
+        [string[]]$ReferencedAssemblies = @(),
+        [string]$IconPath = ""
+    )
+
+    $sourceRoot = Join-Path $cacheRoot "launcher-sources"
+    New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+    $sourceName = [System.IO.Path]::GetFileNameWithoutExtension($OutputAssembly) -replace '[^A-Za-z0-9_.-]', '_'
+    $sourcePath = Join-Path $sourceRoot "$sourceName.cs"
+    Set-Content -Path $sourcePath -Value $Source -Encoding ASCII
+
+    $cscCandidates = @(
+        (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
+        (Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe")
+    )
+    $cscPath = $cscCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if ($cscPath) {
+        $compileArgs = @("/nologo", "/target:winexe", "/out:$OutputAssembly")
+        if ($IconPath -and (Test-Path $IconPath)) {
+            $compileArgs += "/win32icon:$IconPath"
+        }
+        foreach ($assembly in $ReferencedAssemblies) {
+            $compileArgs += "/reference:$assembly.dll"
+        }
+        $compileArgs += $sourcePath
+        & $cscPath @compileArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "C# launcher compile failed for $OutputAssembly."
+        }
+        return
+    }
+
+    $addTypeArgs = @{
+        TypeDefinition = $Source
+        Language = "CSharp"
+        OutputAssembly = $OutputAssembly
+        OutputType = "WindowsApplication"
+    }
+    if ($ReferencedAssemblies.Count -gt 0) {
+        $addTypeArgs["ReferencedAssemblies"] = $ReferencedAssemblies
+    }
+    Add-Type @addTypeArgs
+}
+
 try {
-    Add-Type -TypeDefinition $launcherSource -Language CSharp -OutputAssembly (Join-Path $packageRoot "Accountant Supporter.exe") -OutputType WindowsApplication
-    Add-Type -TypeDefinition $stopperSource -Language CSharp -ReferencedAssemblies "System.Windows.Forms" -OutputAssembly (Join-Path $packageRoot "Stop Accountant Supporter.exe") -OutputType WindowsApplication
+    $appIconPath = Join-Path $repoRoot "assets\accountant-supporter.ico"
+    Compile-PortableExe -Source $launcherSource -OutputAssembly (Join-Path $packageRoot "Accountant Supporter.exe") -IconPath $appIconPath
+    Compile-PortableExe -Source $stopperSource -ReferencedAssemblies @("System.Windows.Forms") -OutputAssembly (Join-Path $packageRoot "Stop Accountant Supporter.exe") -IconPath $appIconPath
 } catch {
     Write-Warning "Could not compile friendly EXE launchers. VBS/BAT launchers are still available. $($_.Exception.Message)"
 }
