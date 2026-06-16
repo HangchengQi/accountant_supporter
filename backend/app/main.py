@@ -6,6 +6,7 @@ import mimetypes
 import os
 import secrets
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -87,26 +88,47 @@ def active_workflow() -> Workflow:
     return load_workflow(get_workflow_path())
 
 
-def app_update_status() -> dict[str, Any]:
+def app_update_status(check_remote: bool = True) -> dict[str, Any]:
     root = get_repo_root()
     is_repo = (root / ".git").exists()
     commit = ""
     branch = ""
+    remote_commit = ""
+    behind_count = 0
+    update_available = False
+    update_check_error = ""
     if is_repo:
         commit = _run_git_command(["rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
         branch = _run_git_command(["branch", "--show-current"], timeout=10)["stdout"].strip()
+        if check_remote:
+            try:
+                _run_git_command(["fetch", "--quiet"], timeout=60)
+                upstream = _run_git_command(
+                    ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+                    timeout=10,
+                )["stdout"].strip()
+                remote_commit = _run_git_command(["rev-parse", "--short", upstream], timeout=10)["stdout"].strip()
+                behind_text = _run_git_command(["rev-list", "--count", f"HEAD..{upstream}"], timeout=10)["stdout"].strip()
+                behind_count = int(behind_text or "0")
+                update_available = behind_count > 0
+            except Exception as exc:
+                update_check_error = str(exc)
     return {
         "repo_root": str(root),
         "is_git_repo": is_repo,
         "branch": branch,
         "commit": commit,
+        "remote_commit": remote_commit,
+        "behind_count": behind_count,
+        "update_available": update_available,
+        "update_check_error": update_check_error,
     }
 
 
-def pull_latest_app_update() -> dict[str, Any]:
-    status = app_update_status()
+def sync_latest_app_update() -> dict[str, Any]:
+    status = app_update_status(check_remote=False)
     if not status["is_git_repo"]:
-        raise ValueError("This app folder is not a git repository.")
+        raise ValueError("This app install cannot update itself.")
     before = status["commit"]
     result = _run_git_command(["pull", "--ff-only"], timeout=120)
     after = _run_git_command(["rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
@@ -120,6 +142,22 @@ def pull_latest_app_update() -> dict[str, Any]:
         "returncode": result["returncode"],
         "restart_recommended": before != after,
     }
+
+
+def schedule_app_restart(server: ThreadingHTTPServer) -> None:
+    backend_root = Path(__file__).resolve().parents[1]
+    helper_code = (
+        "import subprocess, time\n"
+        "time.sleep(2)\n"
+        f"subprocess.Popen({[sys.executable, '-u', '-m', 'app.main']!r}, cwd={str(backend_root)!r}, close_fds=True)\n"
+    )
+    subprocess.Popen([sys.executable, "-c", helper_code], close_fds=True)
+
+    def shutdown_later() -> None:
+        time.sleep(0.5)
+        server.shutdown()
+
+    threading.Thread(target=shutdown_later, daemon=True).start()
 
 
 def _run_git_command(args: list[str], timeout: int) -> dict[str, Any]:
@@ -1729,7 +1767,78 @@ def page_shell(title: str, body: str, active: str = "") -> str:
           </div>
           {nav}
         </header>
+        <div class="update-banner" id="update-banner" hidden>
+          <div>
+            <strong>New version available</strong>
+            <span id="update-banner-message">A newer version is ready.</span>
+          </div>
+          <button type="button" id="update-banner-button">Update and restart</button>
+        </div>
         {body}
+        <script>
+          (function () {{
+            const banner = document.getElementById('update-banner');
+            const message = document.getElementById('update-banner-message');
+            const button = document.getElementById('update-banner-button');
+            if (!banner || !button) {{
+              return;
+            }}
+
+            async function checkForUpdate() {{
+              try {{
+                const response = await fetch('/api/app/update/status', {{ cache: 'no-store' }});
+                const status = await response.json();
+                if (!response.ok || !status.update_available) {{
+                  banner.hidden = true;
+                  return;
+                }}
+                message.textContent = 'A newer version is ready to install.';
+                banner.hidden = false;
+              }} catch (error) {{
+                banner.hidden = true;
+              }}
+            }}
+
+            async function waitForRestart() {{
+              for (let attempt = 0; attempt < 60; attempt += 1) {{
+                await new Promise((resolve) => setTimeout(resolve, 1500));
+                try {{
+                  const response = await fetch('/health', {{ cache: 'no-store' }});
+                  if (response.ok) {{
+                    window.location.reload();
+                    return;
+                  }}
+                }} catch (error) {{
+                  // The app is restarting.
+                }}
+              }}
+              message.textContent = 'Update installed. Refresh this page after the app finishes restarting.';
+            }}
+
+            button.addEventListener('click', async () => {{
+              button.disabled = true;
+              message.textContent = 'Installing update and restarting...';
+              try {{
+                const response = await fetch('/api/app/update', {{ method: 'POST' }});
+                const result = await response.json();
+                if (!response.ok) {{
+                  throw new Error(result.error || 'Unable to install update.');
+                }}
+                if (!result.updated) {{
+                  message.textContent = 'You are already using the latest version.';
+                  banner.hidden = true;
+                  return;
+                }}
+                waitForRestart();
+              }} catch (error) {{
+                button.disabled = false;
+                message.textContent = error.message || 'Unable to install update.';
+              }}
+            }});
+
+            checkForUpdate();
+          }})();
+        </script>
       </body>
     </html>
     """
@@ -1924,21 +2033,6 @@ def index() -> str:
           <div class="status" id="invoice-storage-status">Invoice storage settings are loading.</div>
         </section>
 
-        <section class="connection-card">
-          <div class="connector-head">
-            <div>
-              <h2>App Update</h2>
-              <p>Pull the latest app code from the configured GitHub repository.</p>
-            </div>
-            <span class="pill" id="app-update-pill">Checking</span>
-          </div>
-          <div class="status" id="app-update-status">App update status is loading.</div>
-          <div class="toolbar">
-            <button class="secondary" type="button" id="app-update-run">Update from GitHub</button>
-          </div>
-          <pre class="command-output" id="app-update-output"></pre>
-        </section>
-
       </main>
       <script>
         const mailConnectionState = {
@@ -1948,7 +2042,7 @@ def index() -> str:
         let zohoConnected = false;
 
         async function refreshConnectionStatus() {
-          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshInvoiceStorageSettings(), refreshAppUpdateStatus()]);
+          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshInvoiceStorageSettings()]);
         }
 
         async function refreshOutlookStatus() {
@@ -2406,47 +2500,6 @@ def index() -> str:
           }
           document.getElementById('invoice-directory').value = result.invoice_directory || '';
           await refreshInvoiceStorageSettings();
-        });
-
-        async function refreshAppUpdateStatus() {
-          const response = await fetch('/api/app/update/status');
-          const status = await response.json();
-          const pill = document.getElementById('app-update-pill');
-          const target = document.getElementById('app-update-status');
-          const button = document.getElementById('app-update-run');
-          if (!response.ok || !status.is_git_repo) {
-            pill.textContent = 'Unavailable';
-            pill.className = 'pill';
-            button.disabled = true;
-            target.textContent = status.error || 'This install is not connected to a local git repository.';
-            return;
-          }
-          pill.textContent = status.branch || 'Git repo';
-          pill.className = 'pill ok';
-          button.disabled = false;
-          target.textContent = `Current version ${status.commit || 'unknown'} on ${status.branch || 'current branch'}.`;
-        }
-
-        document.getElementById('app-update-run').addEventListener('click', async () => {
-          const button = document.getElementById('app-update-run');
-          const status = document.getElementById('app-update-status');
-          const output = document.getElementById('app-update-output');
-          button.disabled = true;
-          status.textContent = 'Pulling latest update from GitHub...';
-          output.textContent = '';
-          const response = await fetch('/api/app/update', { method: 'POST' });
-          const result = await response.json();
-          button.disabled = false;
-          if (!response.ok) {
-            status.textContent = result.error || 'Unable to update from GitHub';
-            output.textContent = result.error || '';
-            return;
-          }
-          status.textContent = result.updated
-            ? `Updated from ${result.before_commit} to ${result.after_commit}. Restart the app to run the new version.`
-            : `Already up to date at ${result.after_commit}.`;
-          output.textContent = [result.stdout, result.stderr].filter(Boolean).join('\\n').trim();
-          await refreshAppUpdateStatus();
         });
 
         function renderApprovalSettings(settings, isConnected) {
@@ -3059,7 +3112,11 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/app/update":
             try:
-                self._send_json(pull_latest_app_update())
+                result = sync_latest_app_update()
+                if result["updated"]:
+                    result["restart_scheduled"] = True
+                    schedule_app_restart(self.server)
+                self._send_json(result)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -3646,17 +3703,24 @@ def base_css() -> str:
         font-size: 13px;
         color: #31404a;
       }
-      .command-output {
-        max-height: 180px;
-        overflow: auto;
-        white-space: pre-wrap;
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        background: #ffffff;
-        padding: 10px;
-        color: #31404a;
-        font-size: 12px;
+      .update-banner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        border-bottom: 1px solid #e0c36f;
+        background: #fff8df;
+        color: #4d3a00;
+        padding: 12px clamp(18px, 4vw, 52px);
       }
+      .update-banner[hidden] { display: none; }
+      .update-banner span {
+        display: block;
+        font-size: 13px;
+        margin-top: 2px;
+      }
+      .update-banner button { margin-top: 0; background: #6f5200; }
+      .update-banner button:hover { background: #523d00; }
       article { border-top: 1px solid var(--line); padding: 14px 0; }
       article:first-child { border-top: 0; padding-top: 0; }
       .record-head {
