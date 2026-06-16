@@ -606,7 +606,14 @@ def browse_invoice_storage_directory() -> dict[str, Any]:
         import tkinter as tk
         from tkinter import filedialog
     except Exception as exc:
-        raise RuntimeError("Windows folder picker is not available in this Python environment") from exc
+        selected = _browse_directory_with_powershell()
+        if not selected:
+            settings = invoice_storage_settings()
+            settings["selected"] = False
+            return settings
+        settings = save_invoice_storage_settings({"invoice_directory": selected})
+        settings["selected"] = True
+        return settings
 
     current = Path(invoice_storage_settings()["invoice_directory"]).expanduser()
     initial_dir = current if current.exists() else Path.cwd()
@@ -630,6 +637,32 @@ def browse_invoice_storage_directory() -> dict[str, Any]:
     settings = save_invoice_storage_settings({"invoice_directory": selected})
     settings["selected"] = True
     return settings
+
+
+def _browse_directory_with_powershell() -> str:
+    current = Path(invoice_storage_settings()["invoice_directory"]).expanduser()
+    initial_dir = current if current.exists() else Path.cwd()
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+        "$dialog.Description = 'Choose invoice save directory'; "
+        f"$dialog.SelectedPath = {json.dumps(str(initial_dir))}; "
+        "$result = $dialog.ShowDialog(); "
+        "if ($result -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
 
 
 def approval_settings() -> dict[str, Any]:

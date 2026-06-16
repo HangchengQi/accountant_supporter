@@ -34,6 +34,36 @@ python -m venv .venv
 python -m app.main
 ```
 
+## Portable Windows Build
+
+For customer installs, build a portable folder that includes an embedded Python runtime. Customers do not need to install Python separately.
+
+```powershell
+cd accountant_supporter
+.\scripts\build_portable_windows.ps1
+```
+
+The build output is:
+
+```text
+dist\AccountantSupporterPortable\
+  Start Accountant Supporter.bat
+  runtime\                 embedded Python
+  app\                     app code and workflows
+  data\                    local database, bills, logs
+  README_PORTABLE.txt
+```
+
+To install on another Windows PC, copy the whole `AccountantSupporterPortable` folder and double-click `Start Accountant Supporter.bat`.
+
+If the build machine cannot download Python automatically, download the Python embeddable Windows ZIP first and pass it in:
+
+```powershell
+.\scripts\build_portable_windows.ps1 -PythonEmbedZipPath C:\path\python-3.12.10-embed-amd64.zip
+```
+
+Each customer install should keep its own `data` folder. Do not reuse another customer's database or OAuth token files.
+
 ## Project Shape
 
 ```text
