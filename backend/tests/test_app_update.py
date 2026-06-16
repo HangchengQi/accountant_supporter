@@ -18,9 +18,31 @@ class AppUpdateTest(unittest.TestCase):
             with patch("app.main.get_repo_root", return_value=Path(directory)):
                 status = app_update_status()
 
+        self.assertTrue(status["updates_enabled"])
         self.assertFalse(status["is_git_repo"])
         self.assertEqual(status["commit"], "")
         self.assertEqual(status["branch"], "")
+
+    def test_update_status_respects_disabled_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            with (
+                patch("app.main.get_repo_root", return_value=root),
+                patch.dict("os.environ", {"APP_UPDATES_ENABLED": "false"}),
+                patch("app.main._run_git_command") as git_command,
+            ):
+                status = app_update_status()
+
+        self.assertFalse(status["updates_enabled"])
+        self.assertTrue(status["is_git_repo"])
+        self.assertFalse(status["update_available"])
+        git_command.assert_not_called()
+
+    def test_sync_latest_update_rejects_disabled_updates(self) -> None:
+        with patch.dict("os.environ", {"APP_UPDATES_ENABLED": "false"}):
+            with self.assertRaisesRegex(ValueError, "disabled"):
+                sync_latest_app_update()
 
     def test_update_status_reports_available_update(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

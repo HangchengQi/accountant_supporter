@@ -58,6 +58,7 @@ setlocal
 set "ROOT=%~dp0"
 set "HOST=127.0.0.1"
 set "PORT=8080"
+set "APP_UPDATES_ENABLED=false"
 set "DATABASE_PATH=%ROOT%data\accountant_support.db"
 set "WORKFLOW_PATH=%ROOT%app\workflows\vendor_invoice.v1.json"
 set "BILLS_ROOT=%ROOT%data\bills"
@@ -86,6 +87,7 @@ logsRoot = fso.BuildPath(root, "data\logs")
 
 shell.Environment("PROCESS")("HOST") = "127.0.0.1"
 shell.Environment("PROCESS")("PORT") = "8080"
+shell.Environment("PROCESS")("APP_UPDATES_ENABLED") = "false"
 shell.Environment("PROCESS")("DATABASE_PATH") = dataPath
 shell.Environment("PROCESS")("WORKFLOW_PATH") = workflowPath
 shell.Environment("PROCESS")("BILLS_ROOT") = billsRoot
@@ -148,6 +150,7 @@ public static class AccountantSupporterLauncher
         startInfo.CreateNoWindow = true;
         startInfo.EnvironmentVariables["HOST"] = "127.0.0.1";
         startInfo.EnvironmentVariables["PORT"] = "8080";
+        startInfo.EnvironmentVariables["APP_UPDATES_ENABLED"] = "false";
         startInfo.EnvironmentVariables["DATABASE_PATH"] = Path.Combine(dataRoot, "accountant_support.db");
         startInfo.EnvironmentVariables["WORKFLOW_PATH"] = Path.Combine(root, "app", "workflows", "vendor_invoice.v1.json");
         startInfo.EnvironmentVariables["BILLS_ROOT"] = Path.Combine(dataRoot, "bills");
@@ -246,7 +249,8 @@ Moving the app:
 
 Updating:
 - Portable builds created from a ZIP do not need Python installed.
-- The in-app update banner only works for installs that are connected to an update source.
+- The in-app update banner is disabled for this portable ZIP.
+- To update, shut down the app, unzip the new version, and keep this install's data folder.
 
 Fallback:
 - If the EXE launcher is blocked by Windows policy, use "Start Accountant Supporter.vbs".

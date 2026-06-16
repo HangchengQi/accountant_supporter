@@ -69,6 +69,15 @@ def get_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def app_updates_enabled() -> bool:
+    return os.getenv("APP_UPDATES_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
 storage = SQLiteStorage(get_database_path())
 mail_poll_worker_lock = threading.Lock()
 mail_poll_worker_thread: MailPollWorker | None = None
@@ -90,6 +99,7 @@ def active_workflow() -> Workflow:
 
 def app_update_status(check_remote: bool = True) -> dict[str, Any]:
     root = get_repo_root()
+    updates_enabled = app_updates_enabled()
     is_repo = (root / ".git").exists()
     commit = ""
     branch = ""
@@ -97,7 +107,7 @@ def app_update_status(check_remote: bool = True) -> dict[str, Any]:
     behind_count = 0
     update_available = False
     update_check_error = ""
-    if is_repo:
+    if updates_enabled and is_repo:
         commit = _run_git_command(["rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
         branch = _run_git_command(["branch", "--show-current"], timeout=10)["stdout"].strip()
         if check_remote:
@@ -115,6 +125,7 @@ def app_update_status(check_remote: bool = True) -> dict[str, Any]:
                 update_check_error = str(exc)
     return {
         "repo_root": str(root),
+        "updates_enabled": updates_enabled,
         "is_git_repo": is_repo,
         "branch": branch,
         "commit": commit,
@@ -127,6 +138,8 @@ def app_update_status(check_remote: bool = True) -> dict[str, Any]:
 
 def sync_latest_app_update() -> dict[str, Any]:
     status = app_update_status(check_remote=False)
+    if not status["updates_enabled"]:
+        raise ValueError("App updates are disabled for this install.")
     if not status["is_git_repo"]:
         raise ValueError("This app install cannot update itself.")
     before = status["commit"]

@@ -67,6 +67,8 @@ If the build machine cannot download Python automatically, download the Python e
 
 Each customer install should keep its own `data` folder. Do not reuse another customer's database or OAuth token files.
 
+The GitHub/self-update banner is disabled in portable ZIP builds. To update a portable install, shut down the app, unzip the new build, and preserve that customer's `data` folder.
+
 ## Project Shape
 
 ```text
