@@ -108,16 +108,141 @@ endlocal
 '@
 Set-Content -Path (Join-Path $packageRoot "Stop Accountant Supporter.bat") -Value $stopper -Encoding ASCII
 
+$launcherSource = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+
+public static class AccountantSupporterLauncher
+{
+    public static void Main()
+    {
+        string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+        string dataRoot = Path.Combine(root, "data");
+        Directory.CreateDirectory(dataRoot);
+
+        string pidPath = Path.Combine(dataRoot, "accountant_supporter.pid");
+        if (File.Exists(pidPath))
+        {
+            int existingPid;
+            if (Int32.TryParse(File.ReadAllText(pidPath).Trim(), out existingPid))
+            {
+                try
+                {
+                    Process existing = Process.GetProcessById(existingPid);
+                    if (!existing.HasExited)
+                    {
+                        OpenBrowser();
+                        return;
+                    }
+                }
+                catch
+                {
+                    File.Delete(pidPath);
+                }
+            }
+        }
+
+        string backend = Path.Combine(root, "app", "backend");
+        string python = Path.Combine(root, "runtime", "pythonw.exe");
+        if (!File.Exists(python))
+        {
+            python = Path.Combine(root, "runtime", "python.exe");
+        }
+
+        ProcessStartInfo startInfo = new ProcessStartInfo(python, "-u -m app.main");
+        startInfo.WorkingDirectory = backend;
+        startInfo.UseShellExecute = false;
+        startInfo.CreateNoWindow = true;
+        startInfo.EnvironmentVariables["HOST"] = "127.0.0.1";
+        startInfo.EnvironmentVariables["PORT"] = "8080";
+        startInfo.EnvironmentVariables["DATABASE_PATH"] = Path.Combine(dataRoot, "accountant_support.db");
+        startInfo.EnvironmentVariables["WORKFLOW_PATH"] = Path.Combine(root, "app", "workflows", "vendor_invoice.v1.json");
+        startInfo.EnvironmentVariables["BILLS_ROOT"] = Path.Combine(dataRoot, "bills");
+        startInfo.EnvironmentVariables["BILLING_LOGS_ROOT"] = Path.Combine(dataRoot, "logs");
+
+        Process process = Process.Start(startInfo);
+        File.WriteAllText(pidPath, process.Id.ToString());
+        Thread.Sleep(1500);
+        OpenBrowser();
+    }
+
+    private static void OpenBrowser()
+    {
+        ProcessStartInfo browser = new ProcessStartInfo("http://127.0.0.1:8080/");
+        browser.UseShellExecute = true;
+        Process.Start(browser);
+    }
+}
+'@
+
+$stopperSource = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Windows.Forms;
+
+public static class AccountantSupporterStopper
+{
+    public static void Main()
+    {
+        string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+        string pidPath = Path.Combine(root, "data", "accountant_supporter.pid");
+        if (!File.Exists(pidPath))
+        {
+            MessageBox.Show("Accountant Supporter is not running.", "Accountant Supporter");
+            return;
+        }
+
+        int pid;
+        if (!Int32.TryParse(File.ReadAllText(pidPath).Trim(), out pid))
+        {
+            File.Delete(pidPath);
+            MessageBox.Show("Accountant Supporter is not running.", "Accountant Supporter");
+            return;
+        }
+
+        try
+        {
+            Process process = Process.GetProcessById(pid);
+            if (!process.HasExited)
+            {
+                process.Kill();
+                process.WaitForExit(5000);
+            }
+            File.Delete(pidPath);
+            MessageBox.Show("Accountant Supporter stopped.", "Accountant Supporter");
+        }
+        catch
+        {
+            if (File.Exists(pidPath))
+            {
+                File.Delete(pidPath);
+            }
+            MessageBox.Show("Accountant Supporter is not running.", "Accountant Supporter");
+        }
+    }
+}
+'@
+
+try {
+    Add-Type -TypeDefinition $launcherSource -Language CSharp -OutputAssembly (Join-Path $packageRoot "Accountant Supporter.exe") -OutputType WindowsApplication
+    Add-Type -TypeDefinition $stopperSource -Language CSharp -ReferencedAssemblies "System.Windows.Forms" -OutputAssembly (Join-Path $packageRoot "Stop Accountant Supporter.exe") -OutputType WindowsApplication
+} catch {
+    Write-Warning "Could not compile friendly EXE launchers. VBS/BAT launchers are still available. $($_.Exception.Message)"
+}
+
 $readme = @'
 Accountant Supporter Portable
 
 How to start:
-1. Double-click "Start Accountant Supporter.vbs".
+1. Double-click "Accountant Supporter.exe".
 2. Your browser should open http://127.0.0.1:8080/.
 3. The app runs in the background without a command window.
 
 How to stop:
-1. Double-click "Stop Accountant Supporter.bat".
+1. Double-click "Stop Accountant Supporter.exe".
 2. Closing the browser tab does not stop the local app by itself.
 
 Local data:
@@ -132,6 +257,9 @@ Moving the app:
 Updating:
 - Portable builds created from a ZIP do not need Python installed.
 - The in-app update banner only works for installs that are connected to an update source.
+
+Fallback:
+- If the EXE launchers are blocked by Windows policy, use "Start Accountant Supporter.vbs" and "Stop Accountant Supporter.bat".
 '@
 Set-Content -Path (Join-Path $packageRoot "README_PORTABLE.txt") -Value $readme -Encoding ASCII
 

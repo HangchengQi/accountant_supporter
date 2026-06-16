@@ -47,15 +47,19 @@ The build output is:
 
 ```text
 dist\AccountantSupporterPortable\
-  Start Accountant Supporter.vbs
-  Stop Accountant Supporter.bat
+  Accountant Supporter.exe
+  Stop Accountant Supporter.exe
+  Start Accountant Supporter.vbs     fallback launcher
+  Stop Accountant Supporter.bat      fallback stopper
   runtime\                 embedded Python
   app\                     app code and workflows
   data\                    local database, bills, logs
   README_PORTABLE.txt
 ```
 
-To install on another Windows PC, copy the whole `AccountantSupporterPortable` folder and double-click `Start Accountant Supporter.vbs`. The app starts hidden and opens the browser. To stop it, double-click `Stop Accountant Supporter.bat`.
+To install on another Windows PC, copy the whole `AccountantSupporterPortable` folder and double-click `Accountant Supporter.exe`. The app starts hidden and opens the browser. To stop it, double-click `Stop Accountant Supporter.exe`.
+
+If Windows policy blocks the EXE launchers, use `Start Accountant Supporter.vbs` and `Stop Accountant Supporter.bat` as a fallback.
 
 If the build machine cannot download Python automatically, download the Python embeddable Windows ZIP first and pass it in:
 
