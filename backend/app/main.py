@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import secrets
+import subprocess
 import threading
 import time
 from dataclasses import replace
@@ -63,6 +64,10 @@ def get_logs_root() -> str:
     return os.getenv("BILLING_LOGS_ROOT", "./data/logs")
 
 
+def get_repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
 storage = SQLiteStorage(get_database_path())
 mail_poll_worker_lock = threading.Lock()
 mail_poll_worker_thread: MailPollWorker | None = None
@@ -80,6 +85,65 @@ def health() -> dict[str, str]:
 
 def active_workflow() -> Workflow:
     return load_workflow(get_workflow_path())
+
+
+def app_update_status() -> dict[str, Any]:
+    root = get_repo_root()
+    is_repo = (root / ".git").exists()
+    commit = ""
+    branch = ""
+    if is_repo:
+        commit = _run_git_command(["rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
+        branch = _run_git_command(["branch", "--show-current"], timeout=10)["stdout"].strip()
+    return {
+        "repo_root": str(root),
+        "is_git_repo": is_repo,
+        "branch": branch,
+        "commit": commit,
+    }
+
+
+def pull_latest_app_update() -> dict[str, Any]:
+    status = app_update_status()
+    if not status["is_git_repo"]:
+        raise ValueError("This app folder is not a git repository.")
+    before = status["commit"]
+    result = _run_git_command(["pull", "--ff-only"], timeout=120)
+    after = _run_git_command(["rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
+    return {
+        **status,
+        "before_commit": before,
+        "after_commit": after,
+        "updated": before != after,
+        "stdout": result["stdout"],
+        "stderr": result["stderr"],
+        "returncode": result["returncode"],
+        "restart_recommended": before != after,
+    }
+
+
+def _run_git_command(args: list[str], timeout: int) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=get_repo_root(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("git is not installed or is not available on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("git command timed out") from exc
+    if completed.returncode != 0:
+        output = (completed.stderr or completed.stdout or "git command failed").strip()
+        raise RuntimeError(output)
+    return {
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "returncode": completed.returncode,
+    }
 
 
 def process_email_sample(email: EmailSampleIn) -> ProcessedEmail:
@@ -1860,6 +1924,21 @@ def index() -> str:
           <div class="status" id="invoice-storage-status">Invoice storage settings are loading.</div>
         </section>
 
+        <section class="connection-card">
+          <div class="connector-head">
+            <div>
+              <h2>App Update</h2>
+              <p>Pull the latest app code from the configured GitHub repository.</p>
+            </div>
+            <span class="pill" id="app-update-pill">Checking</span>
+          </div>
+          <div class="status" id="app-update-status">App update status is loading.</div>
+          <div class="toolbar">
+            <button class="secondary" type="button" id="app-update-run">Update from GitHub</button>
+          </div>
+          <pre class="command-output" id="app-update-output"></pre>
+        </section>
+
       </main>
       <script>
         const mailConnectionState = {
@@ -1869,7 +1948,7 @@ def index() -> str:
         let zohoConnected = false;
 
         async function refreshConnectionStatus() {
-          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshInvoiceStorageSettings()]);
+          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshInvoiceStorageSettings(), refreshAppUpdateStatus()]);
         }
 
         async function refreshOutlookStatus() {
@@ -2327,6 +2406,47 @@ def index() -> str:
           }
           document.getElementById('invoice-directory').value = result.invoice_directory || '';
           await refreshInvoiceStorageSettings();
+        });
+
+        async function refreshAppUpdateStatus() {
+          const response = await fetch('/api/app/update/status');
+          const status = await response.json();
+          const pill = document.getElementById('app-update-pill');
+          const target = document.getElementById('app-update-status');
+          const button = document.getElementById('app-update-run');
+          if (!response.ok || !status.is_git_repo) {
+            pill.textContent = 'Unavailable';
+            pill.className = 'pill';
+            button.disabled = true;
+            target.textContent = status.error || 'This install is not connected to a local git repository.';
+            return;
+          }
+          pill.textContent = status.branch || 'Git repo';
+          pill.className = 'pill ok';
+          button.disabled = false;
+          target.textContent = `Current version ${status.commit || 'unknown'} on ${status.branch || 'current branch'}.`;
+        }
+
+        document.getElementById('app-update-run').addEventListener('click', async () => {
+          const button = document.getElementById('app-update-run');
+          const status = document.getElementById('app-update-status');
+          const output = document.getElementById('app-update-output');
+          button.disabled = true;
+          status.textContent = 'Pulling latest update from GitHub...';
+          output.textContent = '';
+          const response = await fetch('/api/app/update', { method: 'POST' });
+          const result = await response.json();
+          button.disabled = false;
+          if (!response.ok) {
+            status.textContent = result.error || 'Unable to update from GitHub';
+            output.textContent = result.error || '';
+            return;
+          }
+          status.textContent = result.updated
+            ? `Updated from ${result.before_commit} to ${result.after_commit}. Restart the app to run the new version.`
+            : `Already up to date at ${result.after_commit}.`;
+          output.textContent = [result.stdout, result.stderr].filter(Boolean).join('\\n').trim();
+          await refreshAppUpdateStatus();
         });
 
         function renderApprovalSettings(settings, isConnected) {
@@ -2876,6 +2996,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             workflow = active_workflow()
             self._send_json(workflow.public_status())
             return
+        if path == "/api/app/update/status":
+            try:
+                self._send_json(app_update_status())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/processed-emails":
             self._send_json([record.to_dict() for record in list_processed_emails()])
             return
@@ -2928,6 +3054,12 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
         if path == "/api/outlook/auth/poll":
             try:
                 self._send_json(poll_outlook_auth())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/app/update":
+            try:
+                self._send_json(pull_latest_app_update())
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -3513,6 +3645,17 @@ def base_css() -> str:
         margin-top: 12px;
         font-size: 13px;
         color: #31404a;
+      }
+      .command-output {
+        max-height: 180px;
+        overflow: auto;
+        white-space: pre-wrap;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #ffffff;
+        padding: 10px;
+        color: #31404a;
+        font-size: 12px;
       }
       article { border-top: 1px solid var(--line); padding: 14px 0; }
       article:first-child { border-top: 0; padding-top: 0; }
