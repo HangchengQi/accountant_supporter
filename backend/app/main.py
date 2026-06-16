@@ -171,6 +171,15 @@ def _initial_zoho_state(extracted: ExtractedFields) -> tuple[str, dict[str, Any]
                 "saved_files": [],
             },
         )
+    if not is_zoho_connected():
+        return (
+            "zoho_not_connected",
+            {
+                "approval_reason": "Zoho Books is not connected. Invoice saved locally without upload approval.",
+                "approval_settings": settings,
+                "saved_files": [],
+            },
+        )
     return (
         "pending_approval",
         {
@@ -192,6 +201,12 @@ def _finalize_processed_email(record: ProcessedEmail, saved_files: list[Path]) -
     payload = dict(record.zoho_payload)
     payload["saved_files"] = [str(path) for path in saved_files]
     settings = approval_settings()
+    if not is_zoho_connected():
+        payload["approval_reason"] = "Zoho Books is not connected. Invoice saved locally without upload approval."
+        payload["approval_settings"] = settings
+        storage.update_processed_email_zoho(record.id, "zoho_not_connected", payload)
+        refreshed = storage.get_processed_email(record.id)
+        return refreshed or record
     if _should_auto_upload(record.extracted, settings):
         try:
             uploaded_payload, updated_extracted = upload_record_to_zoho(record, saved_files)
@@ -366,7 +381,12 @@ def zoho_status() -> dict[str, Any]:
     client = get_zoho_oauth_client()
     status = client.configured_status(has_token=storage.get_oauth_token("zoho") is not None)
     status["settings"]["saved_locally"] = bool(storage.get_connector_settings("zoho"))
+    status["approval_settings"] = approval_settings()
     return status
+
+
+def is_zoho_connected() -> bool:
+    return storage.get_oauth_token("zoho") is not None
 
 
 def save_zoho_settings(data: dict[str, Any]) -> dict[str, Any]:
@@ -806,6 +826,8 @@ def send_daily_billing_log_if_due(now: datetime | None = None) -> dict[str, Any]
 
 
 def _should_auto_upload(extracted: ExtractedFields, settings: dict[str, Any]) -> bool:
+    if not is_zoho_connected():
+        return False
     if not _is_bill_relevant_category(extracted.category):
         return False
     if settings["manual_approval_required"]:
@@ -818,6 +840,8 @@ def _should_auto_upload(extracted: ExtractedFields, settings: dict[str, Any]) ->
 
 
 def _approval_reason(extracted: ExtractedFields, settings: dict[str, Any]) -> str:
+    if not is_zoho_connected():
+        return "Zoho Books is not connected. Invoice saved locally without upload approval."
     if not _is_bill_relevant_category(extracted.category):
         return f"Category {extracted.category} is not bill-relevant."
     if settings["manual_approval_required"]:
@@ -1756,6 +1780,25 @@ def index() -> str:
             <button class="secondary" type="button" id="zoho-save">Save Zoho settings</button>
           </div>
           <div class="status" id="zoho-save-status"></div>
+          <div class="subsection">
+            <div class="connector-head compact-head">
+              <div>
+                <h3>Zoho Upload Approval</h3>
+                <p>Control when AI-selected Zoho expense accounts can upload automatically.</p>
+              </div>
+              <span class="pill" id="approval-pill">Checking</span>
+            </div>
+            <label for="account-threshold">Account Confidence Threshold</label>
+            <input id="account-threshold" type="number" min="0" max="1" step="0.01" />
+            <label class="checkbox-row" for="manual-approval">
+              <input id="manual-approval" type="checkbox" />
+              Require manual approval for every invoice
+            </label>
+            <div class="toolbar">
+              <button class="secondary" type="button" id="approval-save">Save upload rules</button>
+            </div>
+            <div class="status" id="approval-status">Zoho upload rules are loading.</div>
+          </div>
         </section>
 
         <section class="connection-card">
@@ -1817,34 +1860,16 @@ def index() -> str:
           <div class="status" id="invoice-storage-status">Invoice storage settings are loading.</div>
         </section>
 
-        <section class="connection-card">
-          <div class="connector-head">
-            <div>
-              <h2>Approval Rules</h2>
-              <p>Control when AI-selected Zoho expense accounts can auto-upload.</p>
-            </div>
-            <span class="pill" id="approval-pill">Checking</span>
-          </div>
-          <label for="account-threshold">Account Confidence Threshold</label>
-          <input id="account-threshold" type="number" min="0" max="1" step="0.01" />
-          <label class="checkbox-row" for="manual-approval">
-            <input id="manual-approval" type="checkbox" />
-            Require manual approval for every invoice
-          </label>
-          <div class="toolbar">
-            <button class="secondary" type="button" id="approval-save">Save approval rules</button>
-          </div>
-          <div class="status" id="approval-status">Approval rules are loading.</div>
-        </section>
       </main>
       <script>
         const mailConnectionState = {
           outlook: { configured: false, connected: false },
           gmail: { configured: false, connected: false }
         };
+        let zohoConnected = false;
 
         async function refreshConnectionStatus() {
-          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshInvoiceStorageSettings(), refreshApprovalSettings()]);
+          await Promise.all([refreshOutlookStatus(), refreshGmailStatus(), refreshMailProviderSettings(), refreshZohoStatus(), refreshAIStatus(), refreshLogSettings(), refreshInvoiceStorageSettings()]);
         }
 
         async function refreshOutlookStatus() {
@@ -2113,6 +2138,8 @@ def index() -> str:
           document.getElementById('zoho-redirect-uri').value =
             status.settings?.redirect_uri || 'http://127.0.0.1:8080/auth/zoho/callback';
           document.getElementById('zoho-scopes').value = status.settings?.scopes || 'ZohoBooks.fullaccess.all';
+          zohoConnected = Boolean(status.connected);
+          renderApprovalSettings(status.approval_settings || {}, zohoConnected);
           if (!status.configured) {
             target.textContent = 'Zoho Books authentication is not configured by the app admin yet.';
             config.textContent = 'Enter the Zoho Client ID, Client Secret, and Redirect URI, then save.';
@@ -2129,9 +2156,9 @@ def index() -> str:
           config.textContent =
             `US Zoho login: ${status.login_url} | Redirect URI: ${status.redirect_uri}. ` +
             `Client secret is ${status.settings?.has_client_secret ? 'saved locally and hidden' : 'not saved'}.`;
-          pill.textContent = status.connected ? 'Connected' : 'Configured';
-          pill.className = status.connected ? 'pill ok' : 'pill';
-          target.textContent = status.connected ? 'Zoho Books is connected' : 'Ready to connect Zoho Books';
+          pill.textContent = zohoConnected ? 'Connected' : 'Configured';
+          pill.className = zohoConnected ? 'pill ok' : 'pill';
+          target.textContent = zohoConnected ? 'Zoho Books is connected' : 'Ready to connect Zoho Books';
         }
 
         document.getElementById('zoho-save').addEventListener('click', async () => {
@@ -2302,13 +2329,20 @@ def index() -> str:
           await refreshInvoiceStorageSettings();
         });
 
-        async function refreshApprovalSettings() {
-          const response = await fetch('/api/approval/settings');
-          const settings = await response.json();
+        function renderApprovalSettings(settings, isConnected) {
           document.getElementById('account-threshold').value = settings.account_confidence_threshold ?? 0.85;
           document.getElementById('manual-approval').checked = Boolean(settings.manual_approval_required);
           const pill = document.getElementById('approval-pill');
           const status = document.getElementById('approval-status');
+          document.getElementById('account-threshold').disabled = !isConnected;
+          document.getElementById('manual-approval').disabled = !isConnected;
+          document.getElementById('approval-save').disabled = !isConnected;
+          if (!isConnected) {
+            pill.textContent = 'Disabled';
+            pill.className = 'pill';
+            status.textContent = 'Connect Zoho Books before configuring upload approval rules. Bills will be saved locally and kept out of Pending Approval until Zoho is connected.';
+            return;
+          }
           pill.textContent = settings.manual_approval_required ? 'Manual' : 'Auto when confident';
           pill.className = settings.manual_approval_required ? 'pill' : 'pill ok';
           status.textContent = settings.manual_approval_required
@@ -2317,6 +2351,10 @@ def index() -> str:
         }
 
         document.getElementById('approval-save').addEventListener('click', async () => {
+          if (!zohoConnected) {
+            document.getElementById('approval-status').textContent = 'Connect Zoho Books before saving upload approval rules.';
+            return;
+          }
           const response = await fetch('/api/approval/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2327,10 +2365,10 @@ def index() -> str:
           });
           const result = await response.json();
           if (!response.ok) {
-            document.getElementById('approval-status').textContent = result.error || 'Unable to save approval rules';
+            document.getElementById('approval-status').textContent = result.error || 'Unable to save upload rules';
             return;
           }
-          await refreshApprovalSettings();
+          await refreshZohoStatus();
         });
 
         refreshConnectionStatus();
@@ -2342,10 +2380,12 @@ def index() -> str:
 def processing_page() -> str:
     records = storage.list_processed_emails()
     fraud_reviews = list_pending_fraud_reviews()
+    zoho_connected = is_zoho_connected()
     pending_records = [
         record
         for record in records
-        if record.zoho_status in {"pending_approval", "upload_failed"}
+        if zoho_connected
+        and record.zoho_status in {"pending_approval", "upload_failed"}
         and _is_bill_relevant_category(record.extracted.category)
     ]
     fraud_items = "\n".join(render_fraud_review(item) for item in fraud_reviews)
@@ -2408,7 +2448,7 @@ def processing_page() -> str:
             </div>
             <span class="pill">{len(pending_records)} pending</span>
           </div>
-          <div id="pending-records">{pending_items or "<p>No invoices are waiting for approval.</p>"}</div>
+          <div id="pending-records">{pending_items or ("<p>Connect Zoho Books to review upload approvals.</p>" if not zoho_connected else "<p>No invoices are waiting for approval.</p>")}</div>
         </section>
       </main>
       <script>
@@ -2736,6 +2776,7 @@ def history_page() -> str:
                 <option value="manual_submission">Manual submission</option>
                 <option value="failed">Failed submission</option>
                 <option value="not_bill">Not bill-relevant</option>
+                <option value="zoho_not_connected">Zoho not connected</option>
                 <option value="discarded">Discarded</option>
               </select>
             </div>
@@ -3190,6 +3231,8 @@ def render_fraud_review(item: dict[str, Any]) -> str:
 def _approval_status_group(record: ProcessedEmail) -> str:
     if not _is_bill_relevant_category(record.extracted.category) or record.zoho_status == "not_bill":
         return "not_bill"
+    if record.zoho_status == "zoho_not_connected":
+        return "zoho_not_connected"
     if record.zoho_status == "uploaded":
         reason = str(record.zoho_payload.get("approval_reason", ""))
         if reason or record.zoho_payload.get("reviewed_from_processed_email_id"):
@@ -3215,12 +3258,15 @@ def _approval_status_label(record: ProcessedEmail) -> str:
         "manual_submission": "Manual submission",
         "failed": "Failed submission",
         "not_bill": "Not bill-relevant",
+        "zoho_not_connected": "Zoho not connected",
         "discarded": "Discarded",
     }
     if record.zoho_status == "not_bill" or not _is_bill_relevant_category(record.extracted.category):
         return "Not bill-relevant"
     if record.zoho_status == "pending_approval":
         return "Review required"
+    if record.zoho_status == "zoho_not_connected":
+        return "Zoho not connected"
     if record.zoho_status == "upload_failed":
         return "Failed submission"
     if record.zoho_status == "discarded":
@@ -3340,6 +3386,13 @@ def base_css() -> str:
         gap: 14px;
       }
       .connector-head p { margin: 2px 0 0; font-size: 13px; }
+      .compact-head h3 { margin: 0; font-size: 16px; }
+      .compact-head p { margin: 2px 0 0; font-size: 13px; }
+      .subsection {
+        border-top: 1px solid var(--line);
+        margin-top: 16px;
+        padding-top: 16px;
+      }
       label {
         display: block;
         margin: 14px 0 6px;

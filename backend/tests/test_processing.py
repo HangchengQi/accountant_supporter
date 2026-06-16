@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 
 from app.ai import LocalHeuristicProcessor
-from app.main import _initial_zoho_state, process_mail_message, render_record
+from app.main import _finalize_processed_email, _initial_zoho_state, process_mail_message, render_record, storage
 from app.schemas import EmailSampleIn, ExtractedFields, MailMessage, ProcessedEmail
 from app.workflow import Workflow
 
@@ -34,16 +34,55 @@ class LocalProcessorTest(unittest.TestCase):
         self.assertTrue(result.extracted.needs_review)
 
     def test_irrelevant_extraction_is_not_pending_approval(self) -> None:
-        status, payload = _initial_zoho_state(
-            ExtractedFields(
-                category="irrelevant",
-                confidence=0.98,
-                needs_review=False,
+        with patch("app.main.is_zoho_connected", return_value=True):
+            status, payload = _initial_zoho_state(
+                ExtractedFields(
+                    category="irrelevant",
+                    confidence=0.98,
+                    needs_review=False,
+                )
             )
-        )
 
         self.assertEqual(status, "not_bill")
         self.assertIn("not bill-relevant", payload["approval_reason"])
+
+    def test_bill_extraction_is_not_pending_approval_without_zoho_connection(self) -> None:
+        with patch("app.main.is_zoho_connected", return_value=False):
+            status, payload = _initial_zoho_state(
+                ExtractedFields(
+                    category="invoice",
+                    confidence=0.98,
+                    needs_review=False,
+                )
+            )
+
+        self.assertEqual(status, "zoho_not_connected")
+        self.assertIn("Zoho Books is not connected", payload["approval_reason"])
+
+    def test_finalize_bill_record_stays_out_of_approval_without_zoho_connection(self) -> None:
+        record = ProcessedEmail(
+            id=1,
+            created_at=datetime.now(UTC),
+            subject="Invoice",
+            sender="Vendor <billing@example.com>",
+            summary="Invoice summary.",
+            extracted=ExtractedFields(category="invoice", confidence=0.98, needs_review=False),
+            workflow_name="vendor_invoice_email",
+            workflow_version=1,
+            zoho_status="zoho_not_connected",
+            zoho_payload={},
+        )
+
+        with (
+            patch("app.main.is_zoho_connected", return_value=False),
+            patch.object(storage, "update_processed_email_zoho") as update_zoho,
+            patch.object(storage, "get_processed_email", return_value=record),
+        ):
+            result = _finalize_processed_email(record, [])
+
+        self.assertEqual(result.zoho_status, "zoho_not_connected")
+        update_zoho.assert_called_once()
+        self.assertEqual(update_zoho.call_args.args[1], "zoho_not_connected")
 
     def test_process_mail_message_does_not_save_billing_artifacts_for_irrelevant_email(self) -> None:
         message = MailMessage(
