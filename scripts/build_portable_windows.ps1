@@ -70,13 +70,55 @@ endlocal
 '@
 Set-Content -Path (Join-Path $packageRoot "Start Accountant Supporter.bat") -Value $launcher -Encoding ASCII
 
+$hiddenLauncher = @'
+Set shell = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+root = fso.GetParentFolderName(WScript.ScriptFullName)
+backend = fso.BuildPath(root, "app\backend")
+python = fso.BuildPath(root, "runtime\pythonw.exe")
+If Not fso.FileExists(python) Then
+  python = fso.BuildPath(root, "runtime\python.exe")
+End If
+dataPath = fso.BuildPath(root, "data\accountant_support.db")
+workflowPath = fso.BuildPath(root, "app\workflows\vendor_invoice.v1.json")
+billsRoot = fso.BuildPath(root, "data\bills")
+logsRoot = fso.BuildPath(root, "data\logs")
+
+shell.Environment("PROCESS")("HOST") = "127.0.0.1"
+shell.Environment("PROCESS")("PORT") = "8080"
+shell.Environment("PROCESS")("DATABASE_PATH") = dataPath
+shell.Environment("PROCESS")("WORKFLOW_PATH") = workflowPath
+shell.Environment("PROCESS")("BILLS_ROOT") = billsRoot
+shell.Environment("PROCESS")("BILLING_LOGS_ROOT") = logsRoot
+
+command = """" & python & """ -u -m app.main"
+shell.CurrentDirectory = backend
+shell.Run command, 0, False
+WScript.Sleep 1500
+shell.Run "http://127.0.0.1:8080/", 1, False
+'@
+Set-Content -Path (Join-Path $packageRoot "Start Accountant Supporter.vbs") -Value $hiddenLauncher -Encoding ASCII
+
+$stopper = @'
+@echo off
+setlocal
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$connections = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue; foreach ($connection in $connections) { Stop-Process -Id $connection.OwningProcess -Force -ErrorAction SilentlyContinue }; if (-not $connections) { Write-Host 'Accountant Supporter is not running.' } else { Write-Host 'Accountant Supporter stopped.' }"
+pause
+endlocal
+'@
+Set-Content -Path (Join-Path $packageRoot "Stop Accountant Supporter.bat") -Value $stopper -Encoding ASCII
+
 $readme = @'
 Accountant Supporter Portable
 
 How to start:
-1. Double-click "Start Accountant Supporter.bat".
+1. Double-click "Start Accountant Supporter.vbs".
 2. Your browser should open http://127.0.0.1:8080/.
-3. Keep the command window open while using the app.
+3. The app runs in the background without a command window.
+
+How to stop:
+1. Double-click "Stop Accountant Supporter.bat".
+2. Closing the browser tab does not stop the local app by itself.
 
 Local data:
 - data\accountant_support.db stores local settings, tokens, queue state, and processed records.
