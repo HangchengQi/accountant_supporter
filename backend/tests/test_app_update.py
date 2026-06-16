@@ -3,10 +3,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.main import app_update_status, sync_latest_app_update
+from app.main import app_update_status, page_shell, sync_latest_app_update
 
 
 class AppUpdateTest(unittest.TestCase):
+    def test_page_shell_includes_shutdown_control(self) -> None:
+        html = page_shell("Test", "<main></main>")
+
+        self.assertIn('id="shutdown-app-button"', html)
+        self.assertIn("/api/app/shutdown", html)
+
     def test_update_status_marks_non_git_install_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with patch("app.main.get_repo_root", return_value=Path(directory)):

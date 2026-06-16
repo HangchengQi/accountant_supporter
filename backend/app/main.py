@@ -160,6 +160,15 @@ def schedule_app_restart(server: ThreadingHTTPServer) -> None:
     threading.Thread(target=shutdown_later, daemon=True).start()
 
 
+def schedule_app_shutdown(server: ThreadingHTTPServer) -> None:
+    def shutdown_later() -> None:
+        time.sleep(0.5)
+        stop_mail_poll_worker(disable=False)
+        server.shutdown()
+
+    threading.Thread(target=shutdown_later, daemon=True).start()
+
+
 def _run_git_command(args: list[str], timeout: int) -> dict[str, Any]:
     try:
         completed = subprocess.run(
@@ -1798,7 +1807,10 @@ def page_shell(title: str, body: str, active: str = "") -> str:
             <h1>Accountant Supporter</h1>
             <p>Local-first bookkeeping workflow connections and processing.</p>
           </div>
-          {nav}
+          <div class="header-actions">
+            {nav}
+            <button class="secondary shutdown-button" type="button" id="shutdown-app-button">Shut down</button>
+          </div>
         </header>
         <div class="update-banner" id="update-banner" hidden>
           <div>
@@ -1870,6 +1882,39 @@ def page_shell(title: str, body: str, active: str = "") -> str:
             }});
 
             checkForUpdate();
+          }})();
+
+          (function () {{
+            const button = document.getElementById('shutdown-app-button');
+            if (!button) {{
+              return;
+            }}
+            button.addEventListener('click', async () => {{
+              if (!window.confirm('Shut down Accountant Supporter on this computer?')) {{
+                return;
+              }}
+              button.disabled = true;
+              button.textContent = 'Shutting down...';
+              try {{
+                const response = await fetch('/api/app/shutdown', {{ method: 'POST' }});
+                const result = await response.json();
+                if (!response.ok) {{
+                  throw new Error(result.error || 'Unable to shut down the app.');
+                }}
+                document.body.innerHTML = `
+                  <main class="auth-result">
+                    <section class="connection-card">
+                      <h1>Accountant Supporter stopped</h1>
+                      <p>The local app has been shut down. You can close this browser tab.</p>
+                    </section>
+                  </main>
+                `;
+              }} catch (error) {{
+                button.disabled = false;
+                button.textContent = 'Shut down';
+                window.alert(error.message || 'Unable to shut down the app.');
+              }}
+            }});
           }})();
         </script>
       </body>
@@ -3153,6 +3198,10 @@ class AccountantSupportHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
+        if path == "/api/app/shutdown":
+            self._send_json({"shutdown_scheduled": True})
+            schedule_app_shutdown(self.server)
+            return
         if path == "/api/outlook/settings":
             try:
                 self._send_json(save_outlook_settings(self._read_json()))
@@ -3557,6 +3606,13 @@ def base_css() -> str:
         background: #fbfcfd;
       }
       nav { display: flex; flex-wrap: wrap; gap: 8px; }
+      .header-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
       nav a {
         border: 1px solid var(--line);
         border-radius: 6px;
@@ -3653,6 +3709,7 @@ def base_css() -> str:
         cursor: pointer;
       }
       button:hover, .button-link:hover { background: var(--accent-dark); }
+      .shutdown-button { margin-top: 0; }
       .button-link.disabled {
         background: #d8e0e6;
         color: #61717d;

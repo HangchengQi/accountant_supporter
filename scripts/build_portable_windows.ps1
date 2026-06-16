@@ -99,15 +99,6 @@ shell.Run "http://127.0.0.1:8080/", 1, False
 '@
 Set-Content -Path (Join-Path $packageRoot "Start Accountant Supporter.vbs") -Value $hiddenLauncher -Encoding ASCII
 
-$stopper = @'
-@echo off
-setlocal
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$connections = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue; foreach ($connection in $connections) { Stop-Process -Id $connection.OwningProcess -Force -ErrorAction SilentlyContinue }; if (-not $connections) { Write-Host 'Accountant Supporter is not running.' } else { Write-Host 'Accountant Supporter stopped.' }"
-pause
-endlocal
-'@
-Set-Content -Path (Join-Path $packageRoot "Stop Accountant Supporter.bat") -Value $stopper -Encoding ASCII
-
 $launcherSource = @'
 using System;
 using System.Diagnostics;
@@ -177,55 +168,6 @@ public static class AccountantSupporterLauncher
 }
 '@
 
-$stopperSource = @'
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Windows.Forms;
-
-public static class AccountantSupporterStopper
-{
-    public static void Main()
-    {
-        string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
-        string pidPath = Path.Combine(root, "data", "accountant_supporter.pid");
-        if (!File.Exists(pidPath))
-        {
-            MessageBox.Show("Accountant Supporter is not running.", "Accountant Supporter");
-            return;
-        }
-
-        int pid;
-        if (!Int32.TryParse(File.ReadAllText(pidPath).Trim(), out pid))
-        {
-            File.Delete(pidPath);
-            MessageBox.Show("Accountant Supporter is not running.", "Accountant Supporter");
-            return;
-        }
-
-        try
-        {
-            Process process = Process.GetProcessById(pid);
-            if (!process.HasExited)
-            {
-                process.Kill();
-                process.WaitForExit(5000);
-            }
-            File.Delete(pidPath);
-            MessageBox.Show("Accountant Supporter stopped.", "Accountant Supporter");
-        }
-        catch
-        {
-            if (File.Exists(pidPath))
-            {
-                File.Delete(pidPath);
-            }
-            MessageBox.Show("Accountant Supporter is not running.", "Accountant Supporter");
-        }
-    }
-}
-'@
-
 function Compile-PortableExe {
     param(
         [string]$Source,
@@ -277,9 +219,8 @@ function Compile-PortableExe {
 try {
     $appIconPath = Join-Path $repoRoot "assets\accountant-supporter.ico"
     Compile-PortableExe -Source $launcherSource -OutputAssembly (Join-Path $packageRoot "Accountant Supporter.exe") -IconPath $appIconPath
-    Compile-PortableExe -Source $stopperSource -ReferencedAssemblies @("System.Windows.Forms") -OutputAssembly (Join-Path $packageRoot "Stop Accountant Supporter.exe") -IconPath $appIconPath
 } catch {
-    Write-Warning "Could not compile friendly EXE launchers. VBS/BAT launchers are still available. $($_.Exception.Message)"
+    Write-Warning "Could not compile the friendly EXE launcher. The VBS/BAT launchers are still available. $($_.Exception.Message)"
 }
 
 $readme = @'
@@ -291,7 +232,7 @@ How to start:
 3. The app runs in the background without a command window.
 
 How to stop:
-1. Double-click "Stop Accountant Supporter.exe".
+1. Click "Shut down" in the top-right area of the app.
 2. Closing the browser tab does not stop the local app by itself.
 
 Local data:
@@ -308,7 +249,7 @@ Updating:
 - The in-app update banner only works for installs that are connected to an update source.
 
 Fallback:
-- If the EXE launchers are blocked by Windows policy, use "Start Accountant Supporter.vbs" and "Stop Accountant Supporter.bat".
+- If the EXE launcher is blocked by Windows policy, use "Start Accountant Supporter.vbs".
 '@
 Set-Content -Path (Join-Path $packageRoot "README_PORTABLE.txt") -Value $readme -Encoding ASCII
 
